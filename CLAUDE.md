@@ -123,7 +123,10 @@ Sbatch files must be submitted from the repo root (they use `$SLURM_SUBMIT_DIR`)
 - prompt.txt and rubric.toml contents are stored in meta.json settings, so resuming with an edited judge is refused.
 - TOML (stdlib `tomllib`) because nothing extra is needed in the container. Gotcha: `reward` must be above `[criteria]`.
 - Old `--template`/`--score-regex` interface removed (one way to judge).
-- Idea not built yet: `judge.py --follow` (judge job running alongside generation, tailing the rollouts file).
+- `judge.py --follow`: judge job runs alongside generation (`--dependency=after:`), re-reads the growing rollouts
+  file every 30s (ignores an unfinished last line; rollout_idx = line number, stable because generate only appends),
+  stops when the newest run in `<input>.meta.json` finished after the judge started, or after `--follow-timeout`
+  minutes without new lines (then exit 1, run marked `incomplete`). Failed items aren't retried within one run.
 
 ## Current scope
 - Focus: **one-step RL rollouts + LLM judge, on LUMI first**. Tilde comes after.

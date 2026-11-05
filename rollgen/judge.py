@@ -14,6 +14,11 @@ Output JSONL, one line per rollout:
   judge_scores ({criterion: answer}), reward, judge_error (null, or why the reply was unusable;
   then judge_scores and reward are null)
 
+Judge while generating (--follow): start this job while generate.py is still writing --input;
+new rollouts are judged as they appear (checked every 30s). Stops when the generation run
+finishes (per <input>.meta.json), or after --follow-timeout minutes with no new rollouts.
+Needs a .jsonl input.
+
 Resumable: rerun with the same arguments and finished rollouts are skipped.
 Each run is recorded in <output>.meta.json, including the judge's prompt.txt and rubric.toml.
 
@@ -24,7 +29,7 @@ Example:
 import argparse
 import json
 
-from _common import add_server_args, get_messages, read_records, run_resumable
+from _common import add_server_args, get_messages, read_jsonl, read_records, run_resumable
 from _rubric import Judge
 
 
@@ -37,15 +42,27 @@ def main():
     p.add_argument("--max-tokens", type=int, default=2048)
     p.add_argument("--extra-body", type=json.loads, default={},
                    help="extra vLLM sampling params as JSON")
+    p.add_argument("--follow", action="store_true",
+                   help="--input is still being generated: judge new rollouts as they appear, "
+                        "stop when the generation run finishes")
+    p.add_argument("--follow-timeout", type=float, default=60,
+                   help="with --follow: give up after this many minutes without new rollouts (default 60)")
     add_server_args(p)
     args = p.parse_args()
+    if args.follow and not args.input.endswith(".jsonl"):
+        p.error("--follow needs a .jsonl --input")
 
     judge = Judge(args.judge)
     judge.check_reward()
     criteria = judge.criteria_text()
-    rollouts = read_records(args.input)
-    for i, r in enumerate(rollouts):
-        r["rollout_idx"] = i
+
+    def load():
+        records = read_jsonl(args.input, growing=True) if args.follow else read_records(args.input)
+        for i, r in enumerate(records):
+            r["rollout_idx"] = i  # line number: stable, since generate.py only appends
+        if records:
+            render(records[0])  # fail fast on a bad prompt, before sending anything
+        return records
 
     def render(r):
         fields = dict(r)
@@ -57,8 +74,6 @@ def main():
             return judge.prompt.format_map(fields)
         except KeyError as e:
             raise SystemExit(f"prompt.txt placeholder {e} not found in rollout fields: {sorted(fields)}")
-
-    render(rollouts[0])  # fail fast on a bad prompt, before sending anything
 
     async def worker(r, client):
         resp = await client.chat.completions.create(
@@ -74,8 +89,9 @@ def main():
         reward = judge.reward(scores) if scores is not None else None
         return [{**r, "judge_output": text, "judge_scores": scores, "reward": reward, "judge_error": error}]
 
-    run_resumable(rollouts, worker, args, "rollout_idx",
-                  record={"judge_prompt": judge.prompt, "judge_rubric": judge.rubric_text})
+    run_resumable(load(), worker, args, "rollout_idx",
+                  record={"judge_prompt": judge.prompt, "judge_rubric": judge.rubric_text},
+                  follow=(load, args.input + ".meta.json", args.follow_timeout) if args.follow else None)
 
 
 if __name__ == "__main__":

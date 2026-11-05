@@ -22,14 +22,21 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 # Args that may differ between resumed runs without changing what the output contains.
-RESUME_SAFE_ARGS = {"urls", "concurrency", "check_args"}
+RESUME_SAFE_ARGS = {"urls", "concurrency", "check_args", "follow", "follow_timeout"}
+FOLLOW_POLL_SECONDS = 30
 
 
-def read_jsonl(path):
+def read_jsonl(path, growing=False):
+    """growing=True: the file may still be being written by another job, so a missing file
+    is empty and an unfinished last line (no trailing newline yet) is left for later."""
     if not Path(path).is_file():
+        if growing:
+            return []
         sys.exit(f"file not found: {path}")
-    with open(path) as f:
-        return [json.loads(line) for line in f if line.strip()]
+    lines = Path(path).read_text().split("\n")
+    if growing:
+        lines = lines[:-1]  # text after the last newline: empty, or a line still being written
+    return [json.loads(line) for line in lines if line.strip()]
 
 
 def read_records(path):
@@ -135,7 +142,7 @@ def finish_meta(path, meta, **result):
     path.write_text(json.dumps(meta, indent=2) + "\n")
 
 
-def run_resumable(items, worker, args, key, record=None):
+def run_resumable(items, worker, args, key, record=None, follow=None):
     """Call `await worker(item, client) -> list[dict]` for every item and append the returned
     records to `output` (JSONL) as soon as each item finishes.
 
@@ -143,6 +150,9 @@ def run_resumable(items, worker, args, key, record=None):
     are skipped, so a job that timed out can simply be resubmitted with the same arguments.
     Items that fail are logged and skipped; rerun to retry them.
     `args` needs .output and .concurrency; all of it (plus `record`) is recorded in <output>.meta.json.
+
+    follow=(load, producer_meta, timeout_min): the input is still being written by another job
+    (e.g. judging while generating). See _follow.
     """
     if args.check_args:
         start_meta(args, dry_run=True, record=record)
@@ -150,10 +160,53 @@ def run_resumable(items, worker, args, key, record=None):
         sys.exit(0)
     clients = make_clients(args)
     meta_path, meta = start_meta(args, record=record)
-    n_ok, n_fail = asyncio.run(_run(items, worker, Path(args.output), key, clients, args.concurrency))
-    finish_meta(meta_path, meta, items_ok=n_ok, items_failed=n_fail)
-    if n_fail:
+    complete = True
+    if follow:
+        n_ok, n_fail, complete = asyncio.run(
+            _follow(*follow, worker, Path(args.output), key, clients, args.concurrency))
+    else:
+        n_ok, n_fail = asyncio.run(_run(items, worker, Path(args.output), key, clients, args.concurrency))
+    finish_meta(meta_path, meta, items_ok=n_ok, items_failed=n_fail, **({} if complete else {"incomplete": True}))
+    if n_fail or not complete:
         sys.exit(1)
+
+
+def _producer_finished(meta_path, since):
+    """True if the newest run in the producer's <output>.meta.json finished at or after `since`."""
+    try:
+        runs = json.loads(Path(meta_path).read_text())["runs"]
+    except (OSError, ValueError, KeyError):  # not there yet, or caught mid-write
+        return False
+    return bool(runs) and (runs[-1].get("finished") or "") >= since
+
+
+async def _follow(load, producer_meta, timeout_min, worker, output, key, clients, concurrency):
+    """Process items as another job appends them to the input: every FOLLOW_POLL_SECONDS, load()
+    the input again and process the new items. Stop when the producer's run (producer_meta)
+    finishes after we started and everything is processed, or when nothing new has appeared for
+    timeout_min minutes (producer crashed or timed out; rerun to continue).
+    Items that fail are not retried in this process; rerun to retry them."""
+    since = _now()
+    attempted = {r[key] for r in read_jsonl(output)} if output.exists() else set()
+    n_ok = n_fail = 0
+    last_new = time.time()
+    print(f"following {producer_meta.removesuffix('.meta.json')} (new lines every {FOLLOW_POLL_SECONDS}s)", flush=True)
+    while True:
+        finished = _producer_finished(producer_meta, since)  # check before loading: no line is missed
+        new = [it for it in load() if it[key] not in attempted]
+        if new:
+            ok, fail = await _run(new, worker, output, key, clients, concurrency)
+            attempted.update(it[key] for it in new)
+            n_ok, n_fail = n_ok + ok, n_fail + fail
+            last_new = time.time()
+        elif finished:
+            print("the generation run finished and all its lines are processed", flush=True)
+            return n_ok, n_fail, True
+        elif time.time() - last_new > timeout_min * 60:
+            print(f"WARNING: nothing new for {timeout_min:g} min and {producer_meta} shows no finished run; "
+                  f"stopping. Rerun to process the rest.", flush=True)
+            return n_ok, n_fail, False
+        await asyncio.sleep(FOLLOW_POLL_SECONDS)
 
 
 async def _run(items, worker, output, key, clients, concurrency):

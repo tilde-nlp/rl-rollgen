@@ -1,0 +1,13 @@
+# 0-10. A wrong final answer gets 0. A correct one gets 5, plus up to 5 for how it was reached:
+# valid reasoning +2, required answer line +1, clarity 1-5 -> +0..2.
+# Python expression over the criteria below (bools count as 1/0; min, max, abs, round available).
+# Change it and run rollgen/rescore.py to recompute rewards without re-judging.
+reward = "0 if not correct else 5 + 2*valid_reasoning + 1*answer_line + (clarity - 1) / 2"
+
+# Questions for the judge (names become JSON fields and variables in `reward`).
+# type = "bool" -> true/false;  type = "int" -> needs min and max.
+[criteria]
+correct         = { type = "bool", question = "Is the model's final answer numerically equal to the reference final answer?" }
+valid_reasoning = { type = "bool", question = "Are all of the model's steps and calculations correct, with no lucky guesses or errors that cancel out?" }
+answer_line     = { type = "bool", question = "Does the response end with a line of exactly the form \"Answer: <number>\", as instructed?" }
+clarity         = { type = "int", min = 1, max = 5, question = "How clear and concise is the solution? 1 = confusing or padded, 5 = clear and to the point." }
