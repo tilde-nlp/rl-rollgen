@@ -26,6 +26,8 @@ LAUNCHER_HELP='Launcher flags (consumed here, everything else goes to the Python
   --vllm-args "ARGS"      extra args for `vllm serve`, e.g. "--max-model-len 16384 --gpu-memory-utilization 0.9"
   --no-stage-model        load the model from Lustre instead of copying it to node-local /tmp first
   --startup-timeout SEC   max wait for all vLLM servers to become healthy (default 1800)
+  --compile-cache DIR     keep vLLM/Triton/MIOpen compile caches in DIR (e.g. on /scratch) so later jobs
+                          start faster; default: node-local /tmp, recompiled every job
 Node count, time limit, partition: regular sbatch options, e.g. `sbatch --nodes=4 --time=04:00:00 ...`.'
 
 # Usage: parse_launcher_args <python script> "$@"
@@ -33,7 +35,7 @@ Node count, time limit, partition: regular sbatch options, e.g. `sbatch --nodes=
 # `--help` prints the launcher flags plus the Python script's own --help, then exits.
 parse_launcher_args() {
   local script=$1; shift
-  MODEL="" SERVED_NAME="" TP=1 VLLM_ARGS="" STAGE_MODEL=1 STARTUP_TIMEOUT=1800
+  MODEL="" SERVED_NAME="" TP=1 VLLM_ARGS="" STAGE_MODEL=1 STARTUP_TIMEOUT=1800 COMPILE_CACHE=""
   CLIENT_ARGS=()
   local want_help=0
   while (( $# )); do
@@ -49,6 +51,8 @@ parse_launcher_args() {
       --no-stage-model)     STAGE_MODEL=0; shift ;;
       --startup-timeout)    STARTUP_TIMEOUT=$2; shift 2 ;;
       --startup-timeout=*)  STARTUP_TIMEOUT=${1#*=}; shift ;;
+      --compile-cache)      COMPILE_CACHE=$2; shift 2 ;;
+      --compile-cache=*)    COMPILE_CACHE=${1#*=}; shift ;;
       -h|--help)            want_help=1; shift ;;
       *)                    CLIENT_ARGS+=("$1"); shift ;;
     esac
@@ -63,7 +67,12 @@ parse_launcher_args() {
   [[ "$TP" =~ ^[0-9]+$ ]] && (( GPUS_PER_NODE % TP == 0 )) || die "--tp $TP must divide GPUS_PER_NODE=$GPUS_PER_NODE"
   : "${SERVED_NAME:=$(basename "$MODEL")}"
   [[ "$SERVED_NAME" != */* ]] || die "--served-name must not contain '/'"
-  export MODEL SERVED_NAME TP VLLM_ARGS STAGE_MODEL STARTUP_TIMEOUT
+  if [ -n "$COMPILE_CACHE" ]; then
+    mkdir -p "$COMPILE_CACHE" || die "cannot create --compile-cache $COMPILE_CACHE"
+    COMPILE_CACHE=$(cd "$COMPILE_CACHE" && pwd)   # absolute: the path must mean the same on every node
+    [[ "$COMPILE_CACHE" != "$HOME"* ]] || die "--compile-cache must not be in \$HOME (100K file quota); use /scratch"
+  fi
+  export MODEL SERVED_NAME TP VLLM_ARGS STAGE_MODEL STARTUP_TIMEOUT COMPILE_CACHE
 
   # Validate the Python script's arguments (typos, missing input, changed settings on resume)
   # now, instead of after minutes of vLLM startup.
@@ -81,6 +90,7 @@ record_run() {
     echo "job:         $SLURM_JOB_ID ($SLURM_JOB_NAME) on partition ${SLURM_JOB_PARTITION:-?}"
     echo "nodes:       $SLURM_JOB_NUM_NODES ($SLURM_JOB_NODELIST)"
     echo "model:       $MODEL (served as '$SERVED_NAME'), TP=$TP, vllm args: ${VLLM_ARGS:-none}"
+    echo "compile cache: ${COMPILE_CACHE:-node-local /tmp (per job)}"
     echo "container:   $SIF"
     echo "git commit:  $(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "git status:"
@@ -105,7 +115,7 @@ start_vllm_servers() {
   srun --label --kill-on-bad-exit=1 --mem=0 \
        --nodes="$nodes" --ntasks="$nodes" --ntasks-per-node=1 \
        --gpus-per-node="$GPUS_PER_NODE" --cpus-per-task="$SLURM_CPUS_PER_TASK" \
-       singularity run -B "$BINDS,$REPO" "$SIF" bash "$REPO/lumi/_vllm_node.sh" &
+       singularity run -B "$BINDS,$REPO${COMPILE_CACHE:+,$COMPILE_CACHE}" "$SIF" bash "$REPO/lumi/_vllm_node.sh" &
   SERVERS_PID=$!
   trap stop_vllm_servers EXIT
   trap 'exit 143' TERM INT HUP
@@ -148,11 +158,20 @@ apply_env() {
   unset ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
   export HWLOC_COMPONENTS=-amd_smi,-rsmi
 
-  # node-local caches (/tmp is RAM, per node)
-  export MIOPEN_USER_DB_PATH="/tmp/$USER-miopen-${SLURM_JOB_ID:-x}"
+  # All caches and the staged model go to one node-local dir (/tmp is RAM), deleted when the job ends.
+  # Never let anything default to ~/.cache: the LUMI home quota is 100K files, and vLLM's
+  # torch.compile/Triton caches alone can exceed it ("Disk quota exceeded" during startup).
+  export NODE_TMP="/tmp/$USER-rollgen-${SLURM_JOB_ID:-$$}"
+  export XDG_CACHE_HOME="$NODE_TMP/cache"            # catch-all for anything using ~/.cache
+  # Compile caches: per job in /tmp by default, or shared across jobs with --compile-cache.
+  local cc="${COMPILE_CACHE:-$NODE_TMP/cache}"
+  export VLLM_CACHE_ROOT="$cc/vllm"                   # torch.compile cache
+  export TORCHINDUCTOR_CACHE_DIR="$cc/inductor"
+  export TRITON_CACHE_DIR="$cc/triton"
+  export MIOPEN_USER_DB_PATH="$cc/miopen"
   export MIOPEN_CUSTOM_CACHE_DIR="$MIOPEN_USER_DB_PATH"
-  export TORCH_EXTENSIONS_DIR="/tmp/$USER-torch-ext-${SLURM_JOB_ID:-x}"
-  mkdir -p "$MIOPEN_USER_DB_PATH" "$TORCH_EXTENSIONS_DIR"
+  export TORCH_EXTENSIONS_DIR="$NODE_TMP/cache/torch-ext"
+  mkdir -p "$VLLM_CACHE_ROOT" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$MIOPEN_USER_DB_PATH" "$TORCH_EXTENSIONS_DIR"
 
   export VLLM_WORKER_MULTIPROC_METHOD=spawn
   export OMP_NUM_THREADS=7

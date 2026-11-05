@@ -1,6 +1,6 @@
 #!/bin/bash
 # Runs INSIDE the container, one copy per node (started by start_vllm_servers in lumi/_common.sh):
-#   1. stages the model to /tmp (node-local RAM; much faster to load than from Lustre)
+#   1. stages the model to $NODE_TMP in /tmp (node-local RAM; much faster to load than from Lustre)
 #   2. starts GPUS_PER_NODE / TP independent vLLM servers on this node
 #   3. waits until they answer /health, then writes their URLs to $RUN_DIR/urls/<node>.txt
 #   4. keeps serving until killed (the batch script kills it when the client is done)
@@ -25,7 +25,7 @@ mapfile -t GPUS < <(tr ',' '\n' <<< "$HIP_VISIBLE_DEVICES" | grep .)
 # --- 1. stage model ---
 MODEL_PATH="$MODEL"
 if [ "$STAGE_MODEL" = 1 ] && [ -d "$MODEL" ]; then
-  MODEL_PATH="/tmp/$USER-model-${SLURM_JOB_ID:-$$}/$(basename "$MODEL")"
+  MODEL_PATH="$NODE_TMP/model/$(basename "$MODEL")"
   mkdir -p "$MODEL_PATH"
   SECONDS=0
   ls "$MODEL" | xargs -P 16 -I{} cp -rL "$MODEL/{}" "$MODEL_PATH/"
@@ -36,7 +36,7 @@ PIDS=()
 cleanup() {
   local rc=$?
   if (( ${#PIDS[@]} )); then kill "${PIDS[@]}" 2>/dev/null || true; wait "${PIDS[@]}" 2>/dev/null || true; fi
-  if [ "$MODEL_PATH" != "$MODEL" ]; then rm -rf "$(dirname "$MODEL_PATH")"; fi
+  rm -rf "$NODE_TMP"   # staged model + caches
   exit "$rc"
 }
 trap cleanup EXIT

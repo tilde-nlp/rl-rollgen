@@ -12,7 +12,7 @@ Resumable: rerun with the same arguments and finished tasks are skipped.
 Each run is recorded in <output>.meta.json.
 
 Example:
-  python rollgen/generate.py --input prompts.jsonl --output rollouts.jsonl --n 8 --max-tokens 2048
+  python rollgen/generate.py --input prompts.jsonl --output rollouts.jsonl --samples-per-prompt 8 --max-tokens 2048
 """
 
 import argparse
@@ -25,7 +25,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--input", required=True)
     p.add_argument("--output", required=True)
-    p.add_argument("--n", type=int, default=8, help="samples per prompt")
+    p.add_argument("--samples-per-prompt", type=int, default=8,
+                   help="completions generated per prompt (the GRPO group size)")
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--max-tokens", type=int, default=2048)
@@ -45,7 +46,7 @@ def main():
         resp = await client.chat.completions.create(
             model=args.served_name,
             messages=messages,
-            n=args.n,
+            n=args.samples_per_prompt,
             temperature=args.temperature,
             top_p=args.top_p,
             max_tokens=args.max_tokens,

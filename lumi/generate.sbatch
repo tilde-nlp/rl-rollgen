@@ -16,7 +16,7 @@
 #
 # Submit from the repo root:
 #   sbatch --nodes=4 lumi/generate.sbatch --model /scratch/.../my-model --tp 2 \
-#       --input data/prompts.jsonl --output data/rollouts.jsonl --n 8 --max-tokens 2048
+#       --input data/prompts.jsonl --output data/rollouts.jsonl --samples-per-prompt 8 --max-tokens 2048
 #
 # All flags:  bash lumi/generate.sbatch --help     (works on a login node)
 # Run record: logs/<job>/run.txt and <output>.meta.json

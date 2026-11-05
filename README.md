@@ -9,7 +9,7 @@ git clone <repo> && cd rl-rollgen      # nothing to install; always submit from 
 
 # 1. generate: 8 samples per prompt, vLLM on 4 nodes, TP=2
 sbatch --nodes=4 lumi/generate.sbatch --model /scratch/.../policy-model --tp 2 \
-    --input data/prompts.jsonl --output data/rollouts.jsonl --n 8 --max-tokens 2048
+    --input data/prompts.jsonl --output data/rollouts.jsonl --samples-per-prompt 8 --max-tokens 2048
 
 # 2. judge
 sbatch --nodes=2 lumi/judge.sbatch --model /scratch/.../judge-model --tp 4 \

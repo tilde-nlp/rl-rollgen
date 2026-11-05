@@ -39,7 +39,13 @@ That script was the owner's working SkyRL training job on LUMI; the facts below 
 - Env lessons to reuse:
   - `HF_HUB_OFFLINE=1`: compute nodes have no internet, so pre-download models.
   - Slurm sets `ROCR_VISIBLE_DEVICES`. Export `HIP_VISIBLE_DEVICES` from it and unset ROCR/CUDA variants (Ray needs this).
-  - Put MIOpen/torch-extension caches in `/tmp/$USER-...-$SLURM_JOB_ID` (node-local RAM).
+  - **Never let caches default to `~/.cache`**: the home quota is 100K files and vLLM's torch.compile cache
+    blew it on the first real run ("Disk quota exceeded"). All caches (VLLM_CACHE_ROOT, TORCHINDUCTOR_CACHE_DIR,
+    TRITON_CACHE_DIR, MIOpen, XDG_CACHE_HOME) and the staged model live in `$NODE_TMP=/tmp/$USER-rollgen-$SLURM_JOB_ID`
+    (node-local RAM), removed when the job ends. Cost: torch.compile runs from scratch every job.
+    Optional `--compile-cache DIR` (e.g. on /scratch, never $HOME) keeps vLLM/Inductor/Triton/MIOpen caches across
+    jobs; it's bind-mounted into the container. Concurrent writes from many servers into one shared cache
+    are untested on LUMI.
   - Stage model weights to `/tmp` before loading (much faster than mmap from Lustre).
   - `PYTHONNOUSERSITE=1`, `VLLM_WORKER_MULTIPROC_METHOD=spawn`.
   - Use the `hsn0` (Slingshot) IP for cross-node traffic.
@@ -80,7 +86,7 @@ Sbatch files must be submitted from the repo root (they use `$SLURM_SUBMIT_DIR`)
 
 ## Interface conventions
 - **Flags only.** Every setting is a command-line flag; no env vars in normal use.
-  `sbatch --nodes=4 lumi/generate.sbatch --model PATH --tp 2 --input ... --output ... --n 8`
+  `sbatch --nodes=4 lumi/generate.sbatch --model PATH --tp 2 --input ... --output ... --samples-per-prompt 8`
   The launcher consumes server flags (`--model`, `--served-name`, `--tp`, `--vllm-args`, `--no-stage-model`,
   `--startup-timeout`) and passes everything else to the Python script. Slurm things (nodes, time, partition)
   stay regular sbatch options. Site config (SIF, BINDS, HF_HOME) is env-overridable but not part of the interface.
@@ -109,7 +115,7 @@ Sbatch files must be submitted from the repo root (they use `$SLURM_SUBMIT_DIR`)
 
 ## Open questions
 - Exact SkyRL input schema (fields, token ids vs. text, loss masks). Deferred.
-- Not yet verified on LUMI (only tested locally with fake srun/singularity/vllm; the fakes live in the
-  session scratchpad, not the repo):
-  `singularity run` entrypoint passing the command through, `ip` available in the container for the hsn0 address
+- Verified on LUMI (first dev-g run, 2026-11-05): `singularity run` works, vllm from the plus image starts,
+  GPU split and model staging work. Not yet verified:
+  `ip` available in the container for the hsn0 address
   (falls back to hostname), cross-node HTTP to port 8000+, and the srun step being stopped cleanly at the end.
