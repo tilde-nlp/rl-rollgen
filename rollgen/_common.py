@@ -93,18 +93,22 @@ def _now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def start_meta(args, dry_run=False):
-    """Append this run to <output>.meta.json; refuse if an earlier run used different settings."""
+def start_meta(args, dry_run=False, record=None):
+    """Append this run to <output>.meta.json; refuse if an earlier run used different settings.
+    `record`: extra settings to store and compare, e.g. the contents of a judge's files."""
     path = Path(args.output + ".meta.json")
     meta = json.loads(path.read_text()) if path.exists() else {"runs": []}
     settings = {k: v for k, v in vars(args).items() if k not in RESUME_SAFE_ARGS}
-    settings["model_path"] = os.environ.get("MODEL")  # set by the cluster launcher, if any
+    # set by the cluster launcher, if any; MODEL_DIR pins the exact HF snapshot
+    settings["model_path"] = os.environ.get("MODEL_DIR") or os.environ.get("MODEL")
+    settings.update(record or {})
     if meta["runs"] and Path(args.output).exists():
         prev = meta["runs"][-1]["settings"]
         diff = {k: (prev.get(k), settings.get(k)) for k in prev.keys() | settings.keys()
                 if prev.get(k) != settings.get(k)}
         if diff:
-            lines = "\n".join(f"  {k}: before={a!r} now={b!r}" for k, (a, b) in sorted(diff.items()))
+            lines = "\n".join(f"  {k}: changed (file contents; see {path})" if "\n" in f"{a}{b}" else
+                              f"  {k}: before={a!r} now={b!r}" for k, (a, b) in sorted(diff.items()))
             sys.exit(f"{args.output} was started with different settings:\n{lines}\n"
                      f"Use a new --output, or delete {args.output} and {path} to start over.")
     if dry_run:
@@ -118,7 +122,7 @@ def start_meta(args, dry_run=False):
         "git_dirty": bool(status) if status is not None else None,
         "host": socket.gethostname(),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
-        "n_servers": len([u for u in (args.urls or "").split(",") if u.strip()]),
+        "n_servers": len([u for u in (getattr(args, "urls", None) or "").split(",") if u.strip()]),
     }
     meta["runs"].append(run)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -131,21 +135,21 @@ def finish_meta(path, meta, **result):
     path.write_text(json.dumps(meta, indent=2) + "\n")
 
 
-def run_resumable(items, worker, args, key):
+def run_resumable(items, worker, args, key, record=None):
     """Call `await worker(item, client) -> list[dict]` for every item and append the returned
     records to `output` (JSONL) as soon as each item finishes.
 
     Each item must have a unique `key` field. Items whose key already appears in `output`
     are skipped, so a job that timed out can simply be resubmitted with the same arguments.
     Items that fail are logged and skipped; rerun to retry them.
-    `args` needs .output and .concurrency; all of it is recorded in <output>.meta.json.
+    `args` needs .output and .concurrency; all of it (plus `record`) is recorded in <output>.meta.json.
     """
     if args.check_args:
-        start_meta(args, dry_run=True)
+        start_meta(args, dry_run=True, record=record)
         print(f"arguments OK ({len(items)} items)")
         sys.exit(0)
     clients = make_clients(args)
-    meta_path, meta = start_meta(args)
+    meta_path, meta = start_meta(args, record=record)
     n_ok, n_fail = asyncio.run(_run(items, worker, Path(args.output), key, clients, args.concurrency))
     finish_meta(meta_path, meta, items_ok=n_ok, items_failed=n_fail)
     if n_fail:

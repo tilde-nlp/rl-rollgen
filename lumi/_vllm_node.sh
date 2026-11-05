@@ -4,13 +4,13 @@
 #   2. starts GPUS_PER_NODE / TP independent vLLM servers on this node
 #   3. waits until they answer /health, then writes their URLs to $RUN_DIR/urls/<node>.txt
 #   4. keeps serving until killed (the batch script kills it when the client is done)
-# Server config (MODEL, SERVED_NAME, TP, VLLM_ARGS, STAGE_MODEL) comes from the environment,
+# Server config (MODEL_DIR, SERVED_NAME, TP, VLLM_ARGS, STAGE_MODEL) comes from the environment,
 # set by parse_launcher_args in lumi/_common.sh from the sbatch flags.
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 apply_env
-: "${MODEL:?MODEL not set (this script is started by lumi/*.sbatch, not by hand)}"
+: "${MODEL_DIR:?MODEL_DIR not set (this script is started by lumi/*.sbatch, not by hand)}"
 
 NODE="${SLURMD_NODENAME:-$(hostname)}"
 # Address other nodes use to reach this one: the Slingshot interface if present.
@@ -23,13 +23,14 @@ mapfile -t GPUS < <(tr ',' '\n' <<< "$HIP_VISIBLE_DEVICES" | grep .)
 (( ${#GPUS[@]} == GPUS_PER_NODE )) || die "[$NODE] expected $GPUS_PER_NODE GPUs, got ${#GPUS[@]} (HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES)"
 
 # --- 1. stage model ---
-MODEL_PATH="$MODEL"
-if [ "$STAGE_MODEL" = 1 ] && [ -d "$MODEL" ]; then
-  MODEL_PATH="$NODE_TMP/model/$(basename "$MODEL")"
+# -L: HF cache snapshots are symlinks into blobs/; copy the real files.
+MODEL_PATH="$MODEL_DIR"
+if [ "$STAGE_MODEL" = 1 ]; then
+  MODEL_PATH="$NODE_TMP/model/$SERVED_NAME"
   mkdir -p "$MODEL_PATH"
   SECONDS=0
-  ls "$MODEL" | xargs -P 16 -I{} cp -rL "$MODEL/{}" "$MODEL_PATH/"
-  log "staged $MODEL -> $MODEL_PATH in ${SECONDS}s"
+  ls "$MODEL_DIR" | xargs -P 16 -I{} cp -rL "$MODEL_DIR/{}" "$MODEL_PATH/"
+  log "staged $MODEL_DIR -> $MODEL_PATH in ${SECONDS}s"
 fi
 
 PIDS=()

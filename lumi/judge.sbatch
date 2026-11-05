@@ -16,7 +16,7 @@
 #
 # Submit from the repo root:
 #   sbatch --nodes=2 lumi/judge.sbatch --model /scratch/.../judge-model --tp 4 \
-#       --input data/rollouts.jsonl --output data/judged.jsonl --template judge_prompts/correctness.txt
+#       --input data/rollouts.jsonl --output data/judged.jsonl --judge judges/correctness
 #
 # Chain after a generation job:
 #   jid=$(sbatch --parsable lumi/generate.sbatch ...)

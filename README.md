@@ -13,8 +13,11 @@ sbatch --nodes=4 lumi/generate.sbatch --model /scratch/.../policy-model --tp 2 \
 
 # 2. judge
 sbatch --nodes=2 lumi/judge.sbatch --model /scratch/.../judge-model --tp 4 \
-    --input data/rollouts.jsonl --output data/judged.jsonl \
-    --template judge_prompts/correctness.txt
+    --input data/rollouts.jsonl --output data/judged.jsonl --judge judges/correctness
+
+# 3. changed the reward formula in judges/correctness/rubric.toml? recompute, no GPUs needed
+#    (needs Python >= 3.11; on a LUMI login node: module load cray-python)
+python3 rollgen/rescore.py --input data/judged.jsonl --output data/judged_v2.jsonl --judge judges/correctness
 ```
 
 Run the judge right after generation:
@@ -28,6 +31,9 @@ All flags:
 bash lumi/generate.sbatch --help
 bash lumi/judge.sbatch --help
 ```
+
+`--model` takes a model directory or a Hugging Face id already downloaded to the shared HF cache
+(`/scratch/project_465003062/environment/containers/fsdp-skyrl-harbor/hf`), e.g. `--model Qwen/Qwen3-32B`.
 
 A timed-out job can be resubmitted with the same command; it skips finished items.
 
@@ -47,13 +53,30 @@ Each task needs `prompt` (string or list of chat messages) or `messages`; other 
 
 Outputs:
 - `rollouts.jsonl`: one line per sample, input fields + `task_idx`, `sample_idx`, `completion`, `finish_reason`
-- `judged.jsonl`: rollout fields + `judge_output`, `judge_score`
+- `judged.jsonl`: rollout fields + `judge_output` (raw reply), `judge_scores` (answer per criterion), `reward`,
+  `judge_error` (why a reply was unusable; then scores and reward are null)
 - `<output>.meta.json`: settings, model, git commit, timing of every run that wrote the file
 - `logs/<date>-<job name>-<job id>/`: `slurm.out`, `run.txt` (submitted command, code state), vLLM logs per node.
   `logs/latest_run` points to the newest one.
 
-Judge templates are plain text with `{field}` placeholders filled from each rollout (e.g. `{prompt}`, `{completion}`, `{answer}`, `{reward_spec[ground_truth]}`).
-The score is the last match of `--score-regex` (default `SCORE: <number>`). See `judge_prompts/`.
+## Judges
+
+A judge is a folder `judges/<name>/` with two files; copy one to make a new judge.
+- `prompt.txt`: the judge prompt. `{field}` placeholders are filled from each rollout (`{prompt}`, `{completion}`,
+  `{answer}`, `{reward_spec[ground_truth]}`, ...); `{criteria}` becomes the list of questions. Literal braces: `{{ }}`.
+- `rubric.toml`: the questions and the reward formula:
+  ```toml
+  reward = "0 if not correct else max(0, 10 - 5*bad_reasoning - (5 - clarity))"   # before [criteria]
+
+  [criteria]
+  correct       = { type = "bool", question = "Is the final answer correct?" }
+  bad_reasoning = { type = "bool", question = "Is the reasoning wrong even if the answer is right?" }
+  clarity       = { type = "int", min = 1, max = 5, question = "How clear is the explanation?" }
+  ```
+  The judge answers every question in JSON (enforced by vLLM structured outputs); the reward is computed from those
+  answers. `reward` is a Python expression over the criterion names (bools are 1/0; `min`, `max`, `abs`, `round`).
+
+Changing only `reward` → `rollgen/rescore.py`. Changing questions → rerun the judge.
 
 ## Layout
 
@@ -61,7 +84,7 @@ The score is the last match of `--score-regex` (default `SCORE: <number>`). See 
 lumi/           LUMI launchers (sbatch)
 tilde/          Tilde launchers
 rollgen/        the Python that does the work, same on both clusters
-judge_prompts/  judge prompt templates
+judges/         judge prompts + rubrics, one folder per judge
 examples/       small example inputs
 ```
 Files starting with `_` are internals.

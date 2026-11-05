@@ -1,0 +1,8 @@
+# Python expression over the criteria (bools count as 1/0; min, max, abs, round available).
+# Change it and run rollgen/rescore.py to recompute rewards without re-judging.
+reward = "1 if correct else 0"
+
+# Questions for the judge (names become JSON fields and variables in `reward`).
+# type = "bool"  -> true/false;  type = "int" -> needs min and max.
+[criteria]
+correct = { type = "bool", question = "Is the model's final answer equivalent to the reference answer?" }

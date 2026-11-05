@@ -23,7 +23,7 @@ die() { echo "FATAL: $*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 
 LAUNCHER_HELP='Launcher flags (consumed here, everything else goes to the Python script):
-  --model PATH            model dir or HF hub id (required; hub ids must already be in HF_HOME)
+  --model PATH|HUB_ID     model dir, or HF hub id already downloaded to HF_HOME (e.g. Qwen/Qwen3-32B)
   --served-name NAME      name used in API requests (default: basename of --model)
   --tp N                  tensor parallel size per vLLM server (default 1); must divide 8
   --vllm-args "ARGS"      extra args for `vllm serve`, e.g. "--max-model-len 16384 --gpu-memory-utilization 0.9"
@@ -32,6 +32,20 @@ LAUNCHER_HELP='Launcher flags (consumed here, everything else goes to the Python
   --compile-cache DIR     keep vLLM/Triton/MIOpen compile caches in DIR (e.g. on /scratch) so later jobs
                           start faster; default: node-local /tmp, recompiled every job
 Node count, time limit, partition: regular sbatch options, e.g. `sbatch --nodes=4 --time=04:00:00 ...`.'
+
+# Local directory for --model: the dir itself, or the snapshot of a hub id in $HF_HOME/hub
+# (refs/main if present, else the newest snapshot). Empty if not found.
+resolve_model_dir() {
+  local m=$1
+  if [ -d "$m" ]; then (cd "$m" && pwd); return; fi
+  local cache="$HF_HOME/hub/models--${m//\//--}"
+  [ -d "$cache/snapshots" ] || return 0
+  if [ -f "$cache/refs/main" ] && [ -d "$cache/snapshots/$(cat "$cache/refs/main")" ]; then
+    echo "$cache/snapshots/$(cat "$cache/refs/main")"
+  else
+    ls -dt "$cache"/snapshots/*/ 2>/dev/null | head -1 | sed 's:/$::'
+  fi
+}
 
 # Usage: parse_launcher_args <python script> "$@"
 # Sets and exports the server config; leaves the remaining args in CLIENT_ARGS.
@@ -68,6 +82,9 @@ parse_launcher_args() {
   fi
   [ -n "$MODEL" ] || die "--model is required (see --help)"
   [[ "$TP" =~ ^[0-9]+$ ]] && (( GPUS_PER_NODE % TP == 0 )) || die "--tp $TP must divide GPUS_PER_NODE=$GPUS_PER_NODE"
+  MODEL_DIR=$(resolve_model_dir "$MODEL")
+  [ -n "$MODEL_DIR" ] && [ -f "$MODEL_DIR/config.json" ] \
+    || die "--model $MODEL: not a model dir and not found in $HF_HOME/hub (compute nodes are offline: download it first, e.g. HF_HOME=$HF_HOME hf download $MODEL)"
   : "${SERVED_NAME:=$(basename "$MODEL")}"
   [[ "$SERVED_NAME" != */* ]] || die "--served-name must not contain '/'"
   if [ -n "$COMPILE_CACHE" ]; then
@@ -75,7 +92,7 @@ parse_launcher_args() {
     COMPILE_CACHE=$(cd "$COMPILE_CACHE" && pwd)   # absolute: the path must mean the same on every node
     [[ "$COMPILE_CACHE" != "$HOME"* ]] || die "--compile-cache must not be in \$HOME (100K file quota); use /scratch"
   fi
-  export MODEL SERVED_NAME TP VLLM_ARGS STAGE_MODEL STARTUP_TIMEOUT COMPILE_CACHE
+  export MODEL MODEL_DIR SERVED_NAME TP VLLM_ARGS STAGE_MODEL STARTUP_TIMEOUT COMPILE_CACHE
 
   # Validate the Python script's arguments (typos, missing input, changed settings on resume)
   # now, instead of after minutes of vLLM startup.
@@ -105,6 +122,7 @@ record_run() {
     echo "job:         $SLURM_JOB_ID ($SLURM_JOB_NAME) on partition ${SLURM_JOB_PARTITION:-?}"
     echo "nodes:       $SLURM_JOB_NUM_NODES ($SLURM_JOB_NODELIST)"
     echo "model:       $MODEL (served as '$SERVED_NAME'), TP=$TP, vllm args: ${VLLM_ARGS:-none}"
+    echo "model dir:   $MODEL_DIR"
     echo "compile cache: ${COMPILE_CACHE:-node-local /tmp (per job)}"
     echo "container:   $SIF"
     echo "git commit:  $(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"

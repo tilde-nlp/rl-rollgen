@@ -1,0 +1,16 @@
+You are grading a model's answer to a problem.
+
+Problem:
+{prompt}
+
+Reference answer:
+{answer}
+
+Model's response:
+{completion}
+
+Answer these questions about the model's response:
+{criteria}
+
+Ignore formatting differences and the reasoning style; judge only the final answer.
+Reply with a JSON object: first "reasoning" (a brief explanation), then one field per question.

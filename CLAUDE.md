@@ -51,6 +51,8 @@ That script was the owner's working SkyRL training job on LUMI; the facts below 
   - Use the `hsn0` (Slingshot) IP for cross-node traffic.
   - The RCCL/libfabric tuning is only needed for multi-node NCCL (training weight sync).
     Rollout generation with independent per-node vLLM servers shouldn't need it.
+- `--model` accepts a dir or an HF hub id; hub ids resolve to `$HF_HOME/hub/models--Org--Name/snapshots/<refs/main>`
+  on the host (fail early if missing), then are staged with `cp -L` (snapshots are symlinks into blobs/).
 - Style the owner likes: `: "${VAR:=default}"` config overridable from the submitting shell, a config section at the top,
   `die` checks with clear messages, archiving the script and config per run.
 
@@ -66,7 +68,9 @@ rollgen/           # "native" to both clusters: the actual work (generate, judge
   _common.py       #   JSONL I/O, vLLM clients from --urls/$VLLM_URLS, resumable async loop, meta.json, --check-args
   generate.py      #   prompts .jsonl/.parquet -> n samples per prompt -> rollouts JSONL
                    #   (prompt: string | message list (SkyRL/verl) | "messages"); outputs stay JSONL (append/resume)
-  judge.py         #   rollouts JSONL -> + judge_output, judge_score (template + score regex)
+  judge.py         #   rollouts JSONL -> + judge_output, judge_scores, reward, judge_error (--judge judges/<name>)
+  rescore.py       #   recompute `reward` from stored judge_scores with an edited formula (no GPUs)
+  _rubric.py       #   loads judges/<name>/ (prompt.txt + rubric.toml), JSON schema, reward formula
 lumi/              # LUMI-specific glue: Slurm, container, starting vLLM
   _common.sh       #   site config, parse_launcher_args, record_run, start_vllm_servers,
                    #   run_in_container (host side); apply_env (container side)
@@ -74,8 +78,12 @@ lumi/              # LUMI-specific glue: Slurm, container, starting vLLM
                    #   wait for health, write URLs to <run dir>/urls/<node>.txt, serve until killed
   generate.sbatch  #   policy model + rollgen/generate.py
   judge.sbatch     #   judge model + rollgen/judge.py (separate job, chain with --dependency=afterok)
-tilde/             # Tilde-specific glue (not written yet)
-judge_prompts/     # judge prompt templates ({prompt}, {completion}, {answer}, ...); user content, not code
+tilde/             # Tilde-specific glue (plain bash, no Slurm)
+  tunnel.sh        #   ssh -L through a LUMI login node to a LUMI job's vLLM servers (reads <run>/urls/*.txt
+                   #   on LUMI), writes local URLs to logs/tunnel.urls
+  harbor_run.sh    #   `harbor run` with local Docker sandboxes + hosted_vllm model at the tunneled URL
+judges/            # one folder per judge: prompt.txt ({prompt}, {completion}, {answer}, {criteria}) +
+                   #   rubric.toml (reward formula + criteria); user content, not code
 examples/          # tiny example inputs for smoke tests
 logs/              # Slurm and vLLM logs (gitignored)
 ```
@@ -94,7 +102,7 @@ Sbatch files must be submitted from the repo root (they use `$SLURM_SUBMIT_DIR`)
 - `bash lumi/<entry>.sbatch --help` works on a login node: launcher flags plus the Python script's --help.
 - **Same flags on both clusters** (tilde/ launchers must mirror lumi/).
 - **Fail before vLLM starts:** launchers run the Python script with the hidden `--check-args` first
-  (argparse typos, missing input, bad judge template, resume-with-different-settings).
+  (argparse typos, missing input, bad judge prompt/rubric, resume-with-different-settings).
 - **Every run is recorded** (the owner's main pain was tracking changes between runs):
   - `<output>.meta.json` (written by rollgen/, so cluster-agnostic): list of runs with settings, model path,
     git commit + dirty flag, host, job id, timing, ok/failed counts.
@@ -105,9 +113,25 @@ Sbatch files must be submitted from the repo root (they use `$SLURM_SUBMIT_DIR`)
 - Optional per-experiment run files are fine as plain shell scripts holding the sbatch command; no special support.
   If colleagues want more, revisit "one run file per experiment" (variant B).
 
+## Judging design (decided 2026-11-05)
+- Scoring must be configurable outside the code: a judge = `judges/<name>/{prompt.txt,rubric.toml}`.
+- The judge only answers rubric questions (bool, or int with min/max) as JSON; vLLM structured outputs enforce
+  the schema (`response_format` json_schema, with a free-text `reasoning` field first). The judge never does arithmetic.
+- `reward` is a one-line Python expression over criterion names, evaluated with no builtins except
+  min/max/abs/round; names and attribute access are checked up front. Trusted-team tool, not a sandbox.
+- Reweighting is free: `rescore.py` recomputes rewards from stored `judge_scores`. Changed questions need a re-judge.
+- prompt.txt and rubric.toml contents are stored in meta.json settings, so resuming with an edited judge is refused.
+- TOML (stdlib `tomllib`) because nothing extra is needed in the container. Gotcha: `reward` must be above `[criteria]`.
+- Old `--template`/`--score-regex` interface removed (one way to judge).
+- Idea not built yet: `judge.py --follow` (judge job running alongside generation, tailing the rollouts file).
+
 ## Current scope
 - Focus: **one-step RL rollouts + LLM judge, on LUMI first**. Tilde comes after.
-- **Harbor (multi-step) is deferred.** Don't build it until the owner brings it up.
+- **Harbor (multi-step)**: topology is Harbor orchestrator + Docker sandboxes on **Tilde**, vLLM on **LUMI**,
+  only the vLLM HTTP port crosses sites (ssh -L from Tilde via a pinned LUMI login node). Tilde side done
+  (`tilde/tunnel.sh`, `tilde/harbor_run.sh`). LUMI side (a serve-only job that holds servers until walltime,
+  maybe `--api-key`) is still to be discussed with the owner; don't change lumi/ for this yet.
+  Rejected: `DOCKER_HOST=ssh://tilde` (Harbor bind-mounts trial log dirs, which would resolve on Tilde).
 - **SkyRL output format is deferred.** Don't design the export/tokenize step yet.
 
 ## Considered and not adopted
