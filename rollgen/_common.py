@@ -84,7 +84,10 @@ def make_clients(args):
         sys.exit("no vLLM endpoints: pass --urls or set VLLM_URLS")
     if not args.served_name:
         sys.exit("no model name: pass --served-name or set SERVED_NAME")
-    return [AsyncOpenAI(base_url=u.strip(), api_key="EMPTY", timeout=3600, max_retries=3)
+    # API_KEY_FILE: set by the launcher's --api-key-file (the servers then require the key)
+    key_file = os.environ.get("API_KEY_FILE")
+    api_key = Path(key_file).read_text().splitlines()[0].strip() if key_file else "EMPTY"
+    return [AsyncOpenAI(base_url=u.strip(), api_key=api_key, timeout=3600, max_retries=3)
             for u in args.urls.split(",") if u.strip()]
 
 

@@ -38,6 +38,14 @@ bash lumi/generate.sbatch --help
 bash lumi/judge.sbatch --help
 ```
 
+Keep a model served for clients outside the job (e.g. Harbor on Tilde), until `--time` runs out or `scancel`:
+```bash
+(umask 077; openssl rand -hex 24 > ~/.vllm_key)       # once; the servers then require this key
+sbatch --nodes=2 --time=04:00:00 lumi/serve.sbatch --model Qwen/Qwen3-32B --tp 4 --api-key-file ~/.vllm_key
+cat logs/latest_run/urls/*.txt                         # server URLs, once all are up (gone when the job ends)
+```
+`--api-key-file` works for generate/judge too.
+
 `--model` takes a model directory or a Hugging Face id already downloaded to the shared HF cache
 (`/scratch/project_465003062/environment/containers/fsdp-skyrl-harbor/hf`), e.g. `--model Qwen/Qwen3-32B`.
 

@@ -31,6 +31,8 @@ LAUNCHER_HELP='Launcher flags (consumed here, everything else goes to the Python
   --startup-timeout SEC   max wait for all vLLM servers to become healthy (default 1800)
   --compile-cache DIR     keep vLLM/Triton/MIOpen compile caches in DIR (e.g. on /scratch) so later jobs
                           start faster; default: node-local /tmp, recompiled every job
+  --api-key-file FILE     servers require this key (file holds one line; chmod 600). Without it, anyone
+                          on the LUMI network can use the servers while the job runs
 Node count, time limit, partition: regular sbatch options, e.g. `sbatch --nodes=4 --time=04:00:00 ...`.'
 
 # Local directory for --model: the dir itself, or the snapshot of a hub id in $HF_HOME/hub
@@ -47,12 +49,12 @@ resolve_model_dir() {
   fi
 }
 
-# Usage: parse_launcher_args <python script> "$@"
+# Usage: parse_launcher_args <python script, or "" for none (serve.sbatch)> "$@"
 # Sets and exports the server config; leaves the remaining args in CLIENT_ARGS.
 # `--help` prints the launcher flags plus the Python script's own --help, then exits.
 parse_launcher_args() {
   local script=$1; shift
-  MODEL="" SERVED_NAME="" TP=1 VLLM_ARGS="" STAGE_MODEL=1 STARTUP_TIMEOUT=1800 COMPILE_CACHE=""
+  MODEL="" SERVED_NAME="" TP=1 VLLM_ARGS="" STAGE_MODEL=1 STARTUP_TIMEOUT=1800 COMPILE_CACHE="" API_KEY_FILE=""
   CLIENT_ARGS=()
   local want_help=0
   while (( $# )); do
@@ -70,16 +72,21 @@ parse_launcher_args() {
       --startup-timeout=*)  STARTUP_TIMEOUT=${1#*=}; shift ;;
       --compile-cache)      COMPILE_CACHE=$2; shift 2 ;;
       --compile-cache=*)    COMPILE_CACHE=${1#*=}; shift ;;
+      --api-key-file)       API_KEY_FILE=$2; shift 2 ;;
+      --api-key-file=*)     API_KEY_FILE=${1#*=}; shift ;;
       -h|--help)            want_help=1; shift ;;
       *)                    CLIENT_ARGS+=("$1"); shift ;;
     esac
   done
   if (( want_help )); then
-    echo "$LAUNCHER_HELP"; echo
-    echo "Python script flags ($script):"
-    run_in_container python "$REPO/$script" --help
+    echo "$LAUNCHER_HELP"
+    if [ -n "$script" ]; then
+      echo; echo "Python script flags ($script):"
+      run_in_container python "$REPO/$script" --help
+    fi
     exit 0
   fi
+  [ -n "$script" ] || (( ${#CLIENT_ARGS[@]} == 0 )) || die "unknown flag(s): ${CLIENT_ARGS[*]} (see --help)"
   [ -n "$MODEL" ] || die "--model is required (see --help)"
   [[ "$TP" =~ ^[0-9]+$ ]] && (( GPUS_PER_NODE % TP == 0 )) || die "--tp $TP must divide GPUS_PER_NODE=$GPUS_PER_NODE"
   MODEL_DIR=$(resolve_model_dir "$MODEL")
@@ -92,11 +99,17 @@ parse_launcher_args() {
     COMPILE_CACHE=$(cd "$COMPILE_CACHE" && pwd)   # absolute: the path must mean the same on every node
     [[ "$COMPILE_CACHE" != "$HOME"* ]] || die "--compile-cache must not be in \$HOME (100K file quota); use /scratch"
   fi
-  export MODEL MODEL_DIR SERVED_NAME TP VLLM_ARGS STAGE_MODEL STARTUP_TIMEOUT COMPILE_CACHE
+  if [ -n "$API_KEY_FILE" ]; then
+    [ -s "$API_KEY_FILE" ] || die "--api-key-file $API_KEY_FILE: missing or empty"
+    API_KEY_FILE=$(cd "$(dirname "$API_KEY_FILE")" && pwd)/$(basename "$API_KEY_FILE")
+    [[ "$(stat -c %a "$API_KEY_FILE")" == *00 ]] || die "--api-key-file is readable by others: chmod 600 $API_KEY_FILE"
+  fi
+  export MODEL MODEL_DIR SERVED_NAME TP VLLM_ARGS STAGE_MODEL STARTUP_TIMEOUT COMPILE_CACHE API_KEY_FILE
 
   # Validate the Python script's arguments (typos, missing input, changed settings on resume)
   # now, instead of after minutes of vLLM startup.
-  run_in_container python "$REPO/$script" "${CLIENT_ARGS[@]}" --check-args || die "invalid arguments for $script (see above)"
+  [ -z "$script" ] || run_in_container python "$REPO/$script" "${CLIENT_ARGS[@]}" --check-args \
+    || die "invalid arguments for $script (see above)"
 }
 
 # Create this job's log folder, move Slurm's .out file into it, and point logs/latest_run at it.
@@ -124,6 +137,7 @@ record_run() {
     echo "model:       $MODEL (served as '$SERVED_NAME'), TP=$TP, vllm args: ${VLLM_ARGS:-none}"
     echo "model dir:   $MODEL_DIR"
     echo "compile cache: ${COMPILE_CACHE:-node-local /tmp (per job)}"
+    echo "api key:     ${API_KEY_FILE:-none (servers open to the LUMI network)}"
     echo "container:   $SIF"
     echo "git commit:  $(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "git status:"
@@ -148,7 +162,8 @@ start_vllm_servers() {
   srun --label --kill-on-bad-exit=1 --mem=0 \
        --nodes="$nodes" --ntasks="$nodes" --ntasks-per-node=1 \
        --gpus-per-node="$GPUS_PER_NODE" --cpus-per-task="$SLURM_CPUS_PER_TASK" \
-       singularity run -B "$BINDS,$REPO${COMPILE_CACHE:+,$COMPILE_CACHE}" "$SIF" bash "$REPO/lumi/_vllm_node.sh" &
+       singularity run -B "$BINDS,$REPO${COMPILE_CACHE:+,$COMPILE_CACHE}${API_KEY_FILE:+,$API_KEY_FILE}" \
+         "$SIF" bash "$REPO/lumi/_vllm_node.sh" &
   SERVERS_PID=$!
   trap stop_vllm_servers EXIT
   trap 'exit 143' TERM INT HUP
@@ -166,6 +181,7 @@ start_vllm_servers() {
 
 stop_vllm_servers() {
   local rc=$?
+  rm -rf "$RUN_DIR/urls"   # only valid while the servers run; a leftover would look like a live job
   if [ -n "${SERVERS_PID:-}" ] && kill -0 "$SERVERS_PID" 2>/dev/null; then
     echo "stopping vLLM servers"
     kill "$SERVERS_PID" 2>/dev/null || true
@@ -176,7 +192,7 @@ stop_vllm_servers() {
 
 # Run a command in the container on this (the first) node. The client needs no GPUs.
 run_in_container() {
-  singularity run -B "$BINDS,$REPO" "$SIF" "$@"
+  singularity run -B "$BINDS,$REPO${API_KEY_FILE:+,$API_KEY_FILE}" "$SIF" "$@"
 }
 
 # ---------------------------------------------------------------------------

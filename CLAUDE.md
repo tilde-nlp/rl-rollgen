@@ -32,6 +32,9 @@ That script was the owner's working SkyRL training job on LUMI; the facts below 
   (release notes: github.com/lumi-ai-factory/laifs-container-recipes/releases).
   Since 20260513 the runtime env is set by an **OCI entrypoint**, so use **`singularity run`**, not `exec`
   (`exec` skips the entrypoint).
+- dev-g QOS `dev_g`: MaxSubmitPA=1, MaxSubmitPU=1, MaxJobsPU=1 (checked 2026-11-05). Only ONE job per project
+  on dev-g, pending jobs included: no `--dependency` chains and no generate + `judge --follow` there; put the
+  second job on small-g/standard-g, or run them one after the other.
 - Slurm: account `project_465003062`, partition `dev-g` for testing (easy to change), 8 GCDs per node,
   `--cpus-per-task=56`, `--exclusive`, **`--mem=0` (required on dev-g, OOM otherwise; also pass it to srun)**.
 - Paths: `ROOT=/scratch/project_465003062/environment/containers/fsdp-skyrl-harbor`, `HF_HOME=$ROOT/hf`,
@@ -48,7 +51,12 @@ That script was the owner's working SkyRL training job on LUMI; the facts below 
     are untested on LUMI.
   - Stage model weights to `/tmp` before loading (much faster than mmap from Lustre).
   - `PYTHONNOUSERSITE=1`, `VLLM_WORKER_MULTIPROC_METHOD=spawn`.
-  - Use the `hsn0` (Slingshot) IP for cross-node traffic.
+  - Use the `hsn0` (Slingshot) IP for cross-node traffic. The container has **no `ip` command** (checked
+    2026-11-05), so `_vllm_node.sh` reads the address with a Python ioctl. Compute nodes have nmn0 (10.120.x,
+    management) and hsn0-3 (10.253.x, Slingshot).
+  - Login node `uan01` reaches a compute node's port 8000 by hsn0 IP and by hostname (checked 2026-11-05,
+    dev-g). So the Tilde -> login node -> compute node `ssh -L` path is possible; the Tilde side of it is not yet
+    tested (needs the owner's ssh key on Tilde). No direct ssh into compute nodes on LUMI.
   - The RCCL/libfabric tuning is only needed for multi-node NCCL (training weight sync).
     Rollout generation with independent per-node vLLM servers shouldn't need it.
 - `--model` accepts a dir or an HF hub id; hub ids resolve to `$HF_HOME/hub/models--Org--Name/snapshots/<refs/main>`
@@ -78,6 +86,7 @@ lumi/              # LUMI-specific glue: Slurm, container, starting vLLM
                    #   wait for health, write URLs to <run dir>/urls/<node>.txt, serve until killed
   generate.sbatch  #   policy model + rollgen/generate.py
   judge.sbatch     #   judge model + rollgen/judge.py (separate job, chain with --dependency=afterok)
+  serve.sbatch     #   servers only, no client, held until walltime/scancel (for Harbor on Tilde via tunnel)
 tilde/             # Tilde-specific glue (plain bash, no Slurm)
   tunnel.sh        #   ssh -L through a LUMI login node to a LUMI job's vLLM servers (reads <run>/urls/*.txt
                    #   on LUMI), writes local URLs to logs/tunnel.urls
@@ -97,7 +106,8 @@ Sbatch files must be submitted from the repo root (they use `$SLURM_SUBMIT_DIR`)
 - **Flags only.** Every setting is a command-line flag; no env vars in normal use.
   `sbatch --nodes=4 lumi/generate.sbatch --model PATH --tp 2 --input ... --output ... --samples-per-prompt 8`
   The launcher consumes server flags (`--model`, `--served-name`, `--tp`, `--vllm-args`, `--no-stage-model`,
-  `--startup-timeout`) and passes everything else to the Python script. Slurm things (nodes, time, partition)
+  `--startup-timeout`, `--compile-cache`, `--api-key-file`) and passes everything else to the Python script
+  (serve.sbatch has no script and rejects other flags). Slurm things (nodes, time, partition)
   stay regular sbatch options. Site config (SIF, BINDS, HF_HOME) is env-overridable but not part of the interface.
 - `bash lumi/<entry>.sbatch --help` works on a login node: launcher flags plus the Python script's --help.
 - **Same flags on both clusters** (tilde/ launchers must mirror lumi/).
@@ -108,7 +118,8 @@ Sbatch files must be submitted from the repo root (they use `$SLURM_SUBMIT_DIR`)
     git commit + dirty flag, host, job id, timing, ok/failed counts.
   - `logs/<date>-<jobname>-<jobid>/` per job: `slurm.out` (moved there by init_run_dir at job start; Slurm keeps
     writing to the moved file), `run.txt` (full command, nodes, model/TP, container, git commit/status/diff),
-    `<node>-vllm-<i>.log`, `urls/`. `logs/latest_run` is a symlink to the newest run folder.
+    `<node>-vllm-<i>.log`, `urls/` (only while the servers run; removed on exit so a dead job never looks alive).
+    `logs/latest_run` is a symlink to the newest run folder.
   - Resuming into an existing output with different settings is refused (only `urls`, `concurrency` may differ).
 - Optional per-experiment run files are fine as plain shell scripts holding the sbatch command; no special support.
   If colleagues want more, revisit "one run file per experiment" (variant B).
@@ -131,9 +142,12 @@ Sbatch files must be submitted from the repo root (they use `$SLURM_SUBMIT_DIR`)
 ## Current scope
 - Focus: **one-step RL rollouts + LLM judge, on LUMI first**. Tilde comes after.
 - **Harbor (multi-step)**: topology is Harbor orchestrator + Docker sandboxes on **Tilde**, vLLM on **LUMI**,
-  only the vLLM HTTP port crosses sites (ssh -L from Tilde via a pinned LUMI login node). Tilde side done
-  (`tilde/tunnel.sh`, `tilde/harbor_run.sh`). LUMI side (a serve-only job that holds servers until walltime,
-  maybe `--api-key`) is still to be discussed with the owner; don't change lumi/ for this yet.
+  only the vLLM HTTP port crosses sites (ssh -L from Tilde via a pinned LUMI login node).
+  LUMI side: `lumi/serve.sbatch` (+ `--api-key-file`, key passed to vLLM as VLLM_API_KEY env, clients read
+  API_KEY_FILE). Tilde side: first drafts `tilde/tunnel.sh`, `tilde/harbor_run.sh` (owner-written; known issues:
+  env-var config instead of flags, only the first URL used, MAX_INPUT_TOKENS = full context).
+  Plan: tunnel + balancer + harbor in one `harbor_run.sh`; start with LiteLLM proxy, measure prefix-cache hit rate
+  (agent loops want session affinity); later `rollgen/harbor_export.py` -> rollouts JSONL.
   Rejected: `DOCKER_HOST=ssh://tilde` (Harbor bind-mounts trial log dirs, which would resolve on Tilde).
 - **SkyRL output format is deferred.** Don't design the export/tokenize step yet.
 
@@ -147,5 +161,4 @@ Sbatch files must be submitted from the repo root (they use `$SLURM_SUBMIT_DIR`)
 - Exact SkyRL input schema (fields, token ids vs. text, loss masks). Deferred.
 - Verified on LUMI (first dev-g run, 2026-11-05): `singularity run` works, vllm from the plus image starts,
   GPU split and model staging work. Not yet verified:
-  `ip` available in the container for the hsn0 address
-  (falls back to hostname), cross-node HTTP to port 8000+, and the srun step being stopped cleanly at the end.
+  cross-node HTTP to port 8000+, and the srun step being stopped cleanly at the end.

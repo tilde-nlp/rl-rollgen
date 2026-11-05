@@ -3,8 +3,8 @@
 #   1. stages the model to $NODE_TMP in /tmp (node-local RAM; much faster to load than from Lustre)
 #   2. starts GPUS_PER_NODE / TP independent vLLM servers on this node
 #   3. waits until they answer /health, then writes their URLs to $RUN_DIR/urls/<node>.txt
-#   4. keeps serving until killed (the batch script kills it when the client is done)
-# Server config (MODEL_DIR, SERVED_NAME, TP, VLLM_ARGS, STAGE_MODEL) comes from the environment,
+#   4. keeps serving until killed (when the client is done, or at the end of a serve.sbatch job)
+# Server config (MODEL_DIR, SERVED_NAME, TP, VLLM_ARGS, STAGE_MODEL, API_KEY_FILE) comes from the environment,
 # set by parse_launcher_args in lumi/_common.sh from the sbatch flags.
 set -euo pipefail
 
@@ -14,9 +14,14 @@ apply_env
 
 NODE="${SLURMD_NODENAME:-$(hostname)}"
 # Address other nodes use to reach this one: the Slingshot interface if present.
-: "${NODE_ADDR:=$(ip -4 -o addr show hsn0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)}"
+# (The container has no `ip` command; ask the kernel directly: SIOCGIFADDR = 0x8915.)
+: "${NODE_ADDR:=$(python -c 'import fcntl, socket, struct
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+print(socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", b"hsn0"))[20:24]))' 2>/dev/null)}"
 : "${NODE_ADDR:=$NODE}"
 mkdir -p "$RUN_DIR"
+# vLLM reads VLLM_API_KEY itself; passing it this way keeps the key out of `ps` output and logs.
+if [ -n "${API_KEY_FILE:-}" ]; then VLLM_API_KEY=$(head -1 "$API_KEY_FILE"); export VLLM_API_KEY; fi
 log() { echo "[$NODE] $*"; }
 
 mapfile -t GPUS < <(tr ',' '\n' <<< "$HIP_VISIBLE_DEVICES" | grep .)
