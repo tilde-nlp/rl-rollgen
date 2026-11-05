@@ -15,7 +15,7 @@
 set -euo pipefail
 
 # --- config (override by exporting) ---
-: "${LUMI_HOST:=uan01.lumi.csc.fi}"   # one fixed login node; lumi.csc.fi round-robins between them
+: "${LUMI_HOST:=lumi-uan01.csc.fi}"   # one fixed login node (lumi-uan01..04); lumi.csc.fi round-robins
 : "${LUMI_USER:=}"                    # LUMI username if it differs from the local one (or use ~/.ssh/config)
 : "${LUMI_REPO:=}"                    # path of this repo's clone on LUMI, e.g. /scratch/project_465003062/$USER/rl-rollgen
 : "${LOCAL_BASE_PORT:=18000}"         # first local port; server i gets LOCAL_BASE_PORT + i
@@ -51,6 +51,7 @@ done
 
 mkdir -p "$(dirname "$URLS_FILE")"
 (IFS=,; echo "${LOCAL[*]}") > "$URLS_FILE"
+echo "${RUN:-explicit --urls}" > "$REPO/logs/tunnel.run"   # recorded by harbor_run.sh
 echo "local URLs written to $URLS_FILE"
 echo "use:  export VLLM_URLS=$(cat "$URLS_FILE")"
 echo "tunnel open via $SSH_TARGET (Ctrl-C to close)"

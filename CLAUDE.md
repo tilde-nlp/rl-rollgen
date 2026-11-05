@@ -54,9 +54,11 @@ That script was the owner's working SkyRL training job on LUMI; the facts below 
   - Use the `hsn0` (Slingshot) IP for cross-node traffic. The container has **no `ip` command** (checked
     2026-11-05), so `_vllm_node.sh` reads the address with a Python ioctl. Compute nodes have nmn0 (10.120.x,
     management) and hsn0-3 (10.253.x, Slingshot).
-  - Login node `uan01` reaches a compute node's port 8000 by hsn0 IP and by hostname (checked 2026-11-05,
-    dev-g). So the Tilde -> login node -> compute node `ssh -L` path is possible; the Tilde side of it is not yet
-    tested (needs the owner's ssh key on Tilde). No direct ssh into compute nodes on LUMI.
+  - Login node `uan01` reaches a compute node's port 8000 by hsn0 IP and by hostname (checked 2026-11-05, dev-g).
+    No direct ssh into compute nodes on LUMI. Networking details for Tilde: see "Harbor on Tilde" below.
+  - LUMI login-node system `python3` is too old for `tomllib` (rescore.py fails there). Run Python tools in the
+    container (`singularity run -B /scratch/project_465003062 $SIF python ...`). Offered, not yet built:
+    `lumi/run.sh <cmd>` wrapper around `run_in_container` for login-node use.
   - The RCCL/libfabric tuning is only needed for multi-node NCCL (training weight sync).
     Rollout generation with independent per-node vLLM servers shouldn't need it.
 - `--model` accepts a dir or an HF hub id; hub ids resolve to `$HF_HOME/hub/models--Org--Name/snapshots/<refs/main>`
@@ -88,9 +90,12 @@ lumi/              # LUMI-specific glue: Slurm, container, starting vLLM
   judge.sbatch     #   judge model + rollgen/judge.py (separate job, chain with --dependency=afterok)
   serve.sbatch     #   servers only, no client, held until walltime/scancel (for Harbor on Tilde via tunnel)
 tilde/             # Tilde-specific glue (plain bash, no Slurm)
+  install.sh       #   one-time: uv + `uv tool install harbor==<pin>` (Docker assumed present)
+  download_dataset.sh #   Harbor registry dataset -> data/harbor/<name>@<version>/<task>/
   tunnel.sh        #   ssh -L through a LUMI login node to a LUMI job's vLLM servers (reads <run>/urls/*.txt
                    #   on LUMI), writes local URLs to logs/tunnel.urls
-  harbor_run.sh    #   `harbor run` with local Docker sandboxes + hosted_vllm model at the tunneled URL
+  harbor_run.sh    #   `harbor run -p data/harbor/...` with local Docker sandboxes + hosted_vllm model at the
+                   #   tunneled URL -> logs/harbor/<job>/ (+ run.txt). Walkthrough: HARBOR_EXAMPLE.md
 judges/            # one folder per judge: prompt.txt ({prompt}, {completion}, {answer}, {criteria}) +
                    #   rubric.toml (reward formula + criteria); user content, not code
 examples/          # tiny example inputs for smoke tests
@@ -141,15 +146,52 @@ Sbatch files must be submitted from the repo root (they use `$SLURM_SUBMIT_DIR`)
 
 ## Current scope
 - Focus: **one-step RL rollouts + LLM judge, on LUMI first**. Tilde comes after.
-- **Harbor (multi-step)**: topology is Harbor orchestrator + Docker sandboxes on **Tilde**, vLLM on **LUMI**,
-  only the vLLM HTTP port crosses sites (ssh -L from Tilde via a pinned LUMI login node).
-  LUMI side: `lumi/serve.sbatch` (+ `--api-key-file`, key passed to vLLM as VLLM_API_KEY env, clients read
-  API_KEY_FILE). Tilde side: first drafts `tilde/tunnel.sh`, `tilde/harbor_run.sh` (owner-written; known issues:
-  env-var config instead of flags, only the first URL used, MAX_INPUT_TOKENS = full context).
-  Plan: tunnel + balancer + harbor in one `harbor_run.sh`; start with LiteLLM proxy, measure prefix-cache hit rate
-  (agent loops want session affinity); later `rollgen/harbor_export.py` -> rollouts JSONL.
-  Rejected: `DOCKER_HOST=ssh://tilde` (Harbor bind-mounts trial log dirs, which would resolve on Tilde).
+- **Harbor (multi-step)**: see "Harbor on Tilde" below.
 - **SkyRL output format is deferred.** Don't design the export/tokenize step yet.
+
+## Harbor on Tilde (status 2026-11-05)
+Topology: Harbor orchestrator + Docker sandboxes on **Tilde**, vLLM on **LUMI**; only the vLLM HTTP port crosses
+sites: `Tilde 127.0.0.1:18000 --ssh -L--> lumi-uan01.csc.fi --TCP--> <compute hsn0 IP>:8000`.
+Rejected: `DOCKER_HOST=ssh://tilde` (Harbor bind-mounts trial log dirs, which would resolve on Tilde).
+
+Facts established:
+- Login node ssh names are `lumi-uan01.csc.fi` .. `lumi-uan04.csc.fi` (`uan01.lumi.csc.fi` does NOT resolve).
+  `lumi.csc.fi` round-robins, so tunnels pin `lumi-uan01.csc.fi` (tunnel.sh default fixed accordingly).
+- LUMI side verified: uan01 -> compute node hsn0 IP / hostname port 8000 works (curl 200 from a nettest job).
+- Tilde (host `perkons`, repo at `/local_data/rusevich/rl-rollgen`, LUMI user `pinnismr`): outbound ssh to LUMI
+  works, key registered, `ssh -o BatchMode=yes pinnismr@lumi-uan01.csc.fi hostname` works once the key is in an
+  ssh-agent and the host key for `lumi-uan01.csc.fi` was accepted once interactively.
+- The key has a **passphrase** -> use ssh-agent. Start the agent BEFORE `tmux new` so all tmux windows inherit
+  it (`eval "$(ssh-agent)"; ssh-add -t 12h <key>; tmux new -s lumi`). A backgrounded `ssh ... &` that needs the
+  passphrase gets "Stopped" (SIGTTIN) and the port never opens; use foreground in tmux or `ssh -f`.
+- Tilde has Docker and uv. Harbor: `bash tilde/install.sh`. No CUDA/vLLM needed
+  on Tilde. Watch /var/lib/docker disk space; task image builds need internet from containers.
+- **NOT YET VERIFIED: the Tilde -> uan01 port forward itself** (was mid-test: tunnel in tmux window 0, then
+  `curl 127.0.0.1:18000/` -> expect 200; "administratively prohibited" = uan01 forbids forwarding -> plan B).
+  Also unverified: vLLM 0.26 enforcing the key from the VLLM_API_KEY env (expect 401 without key).
+
+Runbook for the first end-to-end run (after the tunnel test passes): **`HARBOR_EXAMPLE.md`** (install,
+download, serve, tunnel, run, results, cleanup). Commit/push first; `git pull` on LUMI
+(`/scratch/project_465003062/FAKE_MARCIS/rl-rollgen`) and Tilde.
+
+Harbor layout (decided 2026-11-05; facts from harbor 0.20.0 source):
+- Tasks: `tilde/download_dataset.sh <name>@<ver>` -> `data/harbor/<name>@<ver>/<task>/` (wraps `harbor datasets download`,
+  whose export mode would drop the version). Runs use `-p` on that folder; **`harbor run -d` is not used**
+  (it fetches into the content-addressed `~/.cache/harbor`, hardcoded, hard to browse). harbor_run.sh rejects -d/-t.
+- Jobs: `logs/harbor/<date>-<time>-<dataset>-<model>/` (Harbor's config.json, result.json, job.log, trial dirs
+  `<task>__<id>/` with agent/, verifier/, result.json) + our `run.txt` (appended per (re)start); `logs/harbor/latest`.
+  Harbor ignores plain files in the job dir; same job name + same config = resume, different config = error.
+- harbor_run.sh: flags only (`-p`, `--url`, `--api-key-file`, `--agent`, `-n`, `--max-output-tokens`,
+  `--max-input-tokens` default ctx - max output, `--job-name`); rest goes to `harbor run`. Requires `harbor`
+  on PATH (tilde/install.sh pins 0.20.0). tunnel.sh writes `logs/tunnel.run` (LUMI run name) for run.txt.
+- Tested locally with a fake /v1/models server, stub docker and `--print-config`; never run against real Docker/vLLM.
+
+Remaining known issues in tilde/: tunnel.sh still uses env-var config (LUMI_USER, LUMI_REPO);
+only the first URL is used; `2>/dev/null` on tunnel.sh's URL lookup hides ssh errors. Plan: one `harbor_run.sh` owning tunnel + balancer + harbor (trap cleanup); balancer = LiteLLM
+proxy first, measure vLLM prefix-cache hit rate (agent loops want session affinity), then a session/prefix-aware
+router if needed; later `rollgen/harbor_export.py` -> rollouts JSONL (then judges/tool_use applies).
+Agents running inside the sandbox (not terminus-2) would need the tunnel bound to the docker bridge, not 127.0.0.1.
+127.0.0.1 on Tilde is shared by all users there -> always use the API key.
 
 ## Considered and not adopted
 - **NeMo Gym** (github.com/NVIDIA-NeMo/gym): covers rollout collection, verifiers and LLM judges,
@@ -160,5 +202,9 @@ Sbatch files must be submitted from the repo root (they use `$SLURM_SUBMIT_DIR`)
 ## Open questions
 - Exact SkyRL input schema (fields, token ids vs. text, loss masks). Deferred.
 - Verified on LUMI (first dev-g run, 2026-11-05): `singularity run` works, vllm from the plus image starts,
-  GPU split and model staging work. Not yet verified:
-  cross-node HTTP to port 8000+, and the srun step being stopped cleanly at the end.
+  GPU split and model staging work. Not yet verified: cross-node HTTP to port 8000+, the srun step being
+  stopped cleanly at the end, `serve.sbatch` on real hardware, the judge's JSON structured outputs with
+  Qwen3-32B (check `judge_error` in judged output; pass `--extra-body '{"chat_template_kwargs":
+  {"enable_thinking": false}}'`).
+- Personal launch commands live in `EXAMPLES.md` (gitignored). Its GSM8K example still puts both jobs on dev-g,
+  which the dev_g QOS forbids; the judge should go to small-g.
