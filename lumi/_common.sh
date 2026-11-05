@@ -10,7 +10,10 @@ set -a
 : "${BASE_PORT:=8000}"
 # --- per-job paths (on shared storage) ---
 : "${REPO:=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-: "${RUN_DIR:=$REPO/logs/${SLURM_JOB_NAME:-local}-${SLURM_JOB_ID:-$$}}"   # run.txt, vLLM logs, server URLs
+: "${LOGS_DIR:=$REPO/logs}"
+# One folder per job: slurm.out, run.txt, vLLM logs, server URLs. Set once in the batch script,
+# inherited by every node. Date first, so `ls logs/` is chronological.
+: "${RUN_DIR:=$LOGS_DIR/$(date +%Y%m%d-%H%M%S)-${SLURM_JOB_NAME:-local}-${SLURM_JOB_ID:-$$}}"
 set +a
 
 die() { echo "FATAL: $*" >&2; exit 1; }
@@ -79,11 +82,23 @@ parse_launcher_args() {
   run_in_container python "$REPO/$script" "${CLIENT_ARGS[@]}" --check-args || die "invalid arguments for $script (see above)"
 }
 
-# Write logs/<job>/run.txt: what was submitted and on what code, so runs can be diffed later.
+# Create this job's log folder, move Slurm's .out file into it, and point logs/latest_run at it.
+# Slurm can't write into a folder that doesn't exist at submit time, so the .out file starts in logs/
+# and is moved here; Slurm keeps writing to it (same file, new name).
+init_run_dir() {
+  [ -n "${SLURM_JOB_ID:-}" ] || return 0   # not in a job (e.g. `bash lumi/generate.sbatch --help`)
+  mkdir -p "$RUN_DIR"
+  local out
+  out=$(scontrol show job "$SLURM_JOB_ID" 2>/dev/null | grep -oP 'StdOut=\K\S+' || true)
+  if [ -n "$out" ] && [ -f "$out" ]; then mv "$out" "$RUN_DIR/slurm.out"; fi
+  ln -sfn "$(basename "$RUN_DIR")" "$LOGS_DIR/latest_run"
+  echo "logs: $RUN_DIR (also logs/latest_run)"
+}
+
+# Write <run dir>/run.txt: what was submitted and on what code, so runs can be diffed later.
 # Usage: record_run <entry point name> "$@"   (the original, unparsed arguments)
 record_run() {
   local entry=$1; shift
-  mkdir -p "$RUN_DIR"
   {
     echo "date:        $(date -Is)"
     echo "command:     sbatch --nodes=$SLURM_JOB_NUM_NODES $entry $(printf '%q ' "$@")"

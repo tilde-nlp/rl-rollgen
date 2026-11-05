@@ -19,13 +19,14 @@
 #       --input data/prompts.jsonl --output data/rollouts.jsonl --samples-per-prompt 8 --max-tokens 2048
 #
 # All flags:  bash lumi/generate.sbatch --help     (works on a login node)
-# Run record: logs/<job>/run.txt and <output>.meta.json
+# Logs:       logs/latest_run/ (slurm.out, run.txt, vLLM logs); run record also in <output>.meta.json
 set -euo pipefail
 
 REPO="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 [ -f "$REPO/lumi/_common.sh" ] || { echo "FATAL: submit from the repo root (sbatch lumi/generate.sbatch ...)" >&2; exit 1; }
 source "$REPO/lumi/_common.sh"
 
+init_run_dir
 parse_launcher_args rollgen/generate.py "$@"
 record_run lumi/generate.sbatch "$@"
 start_vllm_servers

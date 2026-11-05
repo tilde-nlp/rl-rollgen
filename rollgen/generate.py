@@ -1,12 +1,13 @@
 """Generate N completions per prompt from vLLM (one-step RL rollouts).
 
-Input JSONL, one task per line, with either:
-  "messages": [{"role": ..., "content": ...}, ...]   chat messages, or
-  "prompt":   "..."                                    sent as a single user message.
-Any other fields (answer, id, metadata, ...) are copied unchanged to every output record.
+Input: .jsonl (one task per line) or .parquet (e.g. a SkyRL/verl dataset). Each task has one of:
+  "messages": [{"role": ..., "content": ...}, ...]   chat messages
+  "prompt":   [{"role": ..., "content": ...}, ...]   chat messages (SkyRL/verl style)
+  "prompt":   "..."                                    sent as a single user message
+Any other fields (answer, reward_spec, id, ...) are copied unchanged to every output record.
 
 Output JSONL, one line per sample:
-  <input fields> + task_idx (input line number), sample_idx, completion, finish_reason, prompt_tokens
+  <input fields> + task_idx (input record number), sample_idx, completion, finish_reason, prompt_tokens
 
 Resumable: rerun with the same arguments and finished tasks are skipped.
 Each run is recorded in <output>.meta.json.
@@ -18,7 +19,7 @@ Example:
 import argparse
 import json
 
-from _common import add_server_args, read_jsonl, run_resumable
+from _common import add_server_args, get_messages, read_records, run_resumable
 
 
 def main():
@@ -35,14 +36,14 @@ def main():
     add_server_args(p)
     args = p.parse_args()
 
-    tasks = read_jsonl(args.input)
+    tasks = read_records(args.input)
     for i, t in enumerate(tasks):
         t["task_idx"] = i
-        if "messages" not in t and "prompt" not in t:
-            raise SystemExit(f"line {i + 1} of {args.input} has neither 'messages' nor 'prompt'")
+        if get_messages(t) is None:
+            raise SystemExit(f"record {i} of {args.input} has no 'messages' or 'prompt' (string or message list)")
 
     async def worker(task, client):
-        messages = task.get("messages") or [{"role": "user", "content": task["prompt"]}]
+        messages = get_messages(task)
         resp = await client.chat.completions.create(
             model=args.served_name,
             messages=messages,

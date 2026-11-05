@@ -32,6 +32,32 @@ def read_jsonl(path):
         return [json.loads(line) for line in f if line.strip()]
 
 
+def read_records(path):
+    """Read input records from .jsonl or .parquet (e.g. a SkyRL/verl dataset)."""
+    if str(path).endswith(".parquet"):
+        if not Path(path).is_file():
+            sys.exit(f"file not found: {path}")
+        try:
+            import pyarrow.parquet as pq
+        except ImportError:
+            sys.exit("reading .parquet needs pyarrow (pip install pyarrow)")
+        return pq.read_table(path).to_pylist()
+    return read_jsonl(path)
+
+
+def get_messages(record):
+    """Chat messages of a task: "messages", or "prompt" as a list of messages (SkyRL/verl
+    datasets), or "prompt" as a string (sent as one user message). None if there's no prompt."""
+    if record.get("messages"):
+        return record["messages"]
+    prompt = record.get("prompt")
+    if isinstance(prompt, list):
+        return prompt
+    if isinstance(prompt, str):
+        return [{"role": "user", "content": prompt}]
+    return None
+
+
 def add_server_args(parser):
     parser.add_argument("--urls", default=os.environ.get("VLLM_URLS"),
                         help="comma-separated OpenAI-compatible base URLs (default: $VLLM_URLS)")

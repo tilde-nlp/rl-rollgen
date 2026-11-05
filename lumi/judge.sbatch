@@ -16,20 +16,21 @@
 #
 # Submit from the repo root:
 #   sbatch --nodes=2 lumi/judge.sbatch --model /scratch/.../judge-model --tp 4 \
-#       --input data/rollouts.jsonl --output data/judged.jsonl --template rollgen/judge_prompts/correctness.txt
+#       --input data/rollouts.jsonl --output data/judged.jsonl --template judge_prompts/correctness.txt
 #
 # Chain after a generation job:
 #   jid=$(sbatch --parsable lumi/generate.sbatch ...)
 #   sbatch --dependency=afterok:$jid lumi/judge.sbatch ...
 #
 # All flags:  bash lumi/judge.sbatch --help     (works on a login node)
-# Run record: logs/<job>/run.txt and <output>.meta.json
+# Logs:       logs/latest_run/ (slurm.out, run.txt, vLLM logs); run record also in <output>.meta.json
 set -euo pipefail
 
 REPO="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 [ -f "$REPO/lumi/_common.sh" ] || { echo "FATAL: submit from the repo root (sbatch lumi/judge.sbatch ...)" >&2; exit 1; }
 source "$REPO/lumi/_common.sh"
 
+init_run_dir
 parse_launcher_args rollgen/judge.py "$@"
 record_run lumi/judge.sbatch "$@"
 start_vllm_servers

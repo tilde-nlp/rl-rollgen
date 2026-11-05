@@ -64,17 +64,18 @@ That script was the owner's working SkyRL training job on LUMI; the facts below 
 ```
 rollgen/           # "native" to both clusters: the actual work (generate, judge, later filter/tokenize).
   _common.py       #   JSONL I/O, vLLM clients from --urls/$VLLM_URLS, resumable async loop, meta.json, --check-args
-  generate.py      #   prompts JSONL -> n samples per prompt -> rollouts JSONL
+  generate.py      #   prompts .jsonl/.parquet -> n samples per prompt -> rollouts JSONL
+                   #   (prompt: string | message list (SkyRL/verl) | "messages"); outputs stay JSONL (append/resume)
   judge.py         #   rollouts JSONL -> + judge_output, judge_score (template + score regex)
-  judge_prompts/   #   judge prompt templates ({prompt}, {completion}, {answer}, ...)
 lumi/              # LUMI-specific glue: Slurm, container, starting vLLM
   _common.sh       #   site config, parse_launcher_args, record_run, start_vllm_servers,
                    #   run_in_container (host side); apply_env (container side)
   _vllm_node.sh    #   inside container, one per node: stage model to /tmp, start GPUS/TP vLLM servers,
-                   #   wait for health, write URLs to logs/<job>/urls/<node>.txt, serve until killed
+                   #   wait for health, write URLs to <run dir>/urls/<node>.txt, serve until killed
   generate.sbatch  #   policy model + rollgen/generate.py
   judge.sbatch     #   judge model + rollgen/judge.py (separate job, chain with --dependency=afterok)
 tilde/             # Tilde-specific glue (not written yet)
+judge_prompts/     # judge prompt templates ({prompt}, {completion}, {answer}, ...); user content, not code
 examples/          # tiny example inputs for smoke tests
 logs/              # Slurm and vLLM logs (gitignored)
 ```
@@ -97,7 +98,9 @@ Sbatch files must be submitted from the repo root (they use `$SLURM_SUBMIT_DIR`)
 - **Every run is recorded** (the owner's main pain was tracking changes between runs):
   - `<output>.meta.json` (written by rollgen/, so cluster-agnostic): list of runs with settings, model path,
     git commit + dirty flag, host, job id, timing, ok/failed counts.
-  - `logs/<job>/run.txt` (LUMI launcher): full command, nodes, model/TP, container, git commit/status/diff.
+  - `logs/<date>-<jobname>-<jobid>/` per job: `slurm.out` (moved there by init_run_dir at job start; Slurm keeps
+    writing to the moved file), `run.txt` (full command, nodes, model/TP, container, git commit/status/diff),
+    `<node>-vllm-<i>.log`, `urls/`. `logs/latest_run` is a symlink to the newest run folder.
   - Resuming into an existing output with different settings is refused (only `urls`, `concurrency` may differ).
 - Optional per-experiment run files are fine as plain shell scripts holding the sbatch command; no special support.
   If colleagues want more, revisit "one run file per experiment" (variant B).
