@@ -167,7 +167,7 @@ Facts established:
   works, key registered, `ssh -o BatchMode=yes pinnismr@lumi-uan01.csc.fi hostname` works once the key is in an
   ssh-agent and the host key for `lumi-uan01.csc.fi` was accepted once interactively.
 - The key has a **passphrase** -> use ssh-agent. Since harbor_run.sh is one command in one tmux window, the docs
-  (docs/harbor_tilde.md 0c) start the agent inside that window (`eval "$(ssh-agent)"; ssh-add -t 12h <key>`);
+  (docs/harbor_tilde.md 3a) start the agent inside that window (`eval "$(ssh-agent)"; ssh-add -t 12h <key>`);
   once per window, re-`ssh-add` after expiry (open tunnels survive it). Docs suggest `~/.ssh/config`
   `Host lumi-uan01.csc.fi / User / IdentityFile` so `--lumi-host` can stay default. A backgrounded `ssh ... &` that needs the
   passphrase gets "Stopped" (SIGTTIN) and the port never opens. harbor_run.sh uses `ssh -o BatchMode=yes`
@@ -202,6 +202,9 @@ Harbor layout (decided 2026-11-05; facts from harbor 0.20.0 source):
   - Tunnel: `setsid ssh -N -o ControlPath=none -L 127.0.0.1:PORT:<router>` in the background (ControlPath=none:
     the owner's ~/.ssh/config has `Host lumi` (lumi.csc.fi) with ControlMaster auto + ControlPersist 10m; through
     a shared master the forward would outlive our ssh and keep the port taken. Lookups may share the master.
+    The preflight `ssh true` also uses ControlPath=none: through a live master it passed without the key in
+    ssh-agent, then the tunnel failed "Permission denied (publickey)" (seen on Tilde 2026-11-06). That first real
+    run also showed: lookup over ssh + router URL from a real serve job (23510754) work.
     `--lumi-host lumi` works with that alias; any login node reaches compute nodes, round-robin is fine) (setsid: Ctrl-C reaches Harbor only, tunnel
     stays up while Harbor cancels trials), ExitOnForwardFailure + ServerAlive; EXIT trap kills it. Harbor runs in
     the foreground (no exec) so the trap fires; the script exits with Harbor's code.

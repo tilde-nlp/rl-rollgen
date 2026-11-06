@@ -4,9 +4,9 @@
 # One command: wait for the LUMI job's router, open an ssh tunnel to it through a LUMI login node,
 # run Harbor, close the tunnel when Harbor exits. See docs/harbor_tilde.md.
 #
-#   tilde/harbor_run.sh --path data/harbor/terminal-bench@2.0 --n-tasks 5 --n-attempts 4 \
+#   tilde/harbor_run.sh --path data/harbor/terminal-bench@2.0 --n-tasks 5 --n-attempts 4 --lumi-host lumi \
 #       --lumi-repo /scratch/project_465003062/<you>/rl-rollgen --lumi-run 12345678   # the serve.sbatch job id
-#   tilde/harbor_run.sh --resume <job-name> --lumi-repo ... --lumi-run ...
+#   tilde/harbor_run.sh --resume <job-name> --lumi-host lumi --lumi-repo ... --lumi-run ...
 #
 # What to run:
 #   -p, --path DIR           local dataset (or single task) folder, from tilde/download_dataset.sh (required)
@@ -112,8 +112,10 @@ if [ -z "$URL" ]; then
   command -v setsid >/dev/null || die "setsid not found (util-linux)"
   # BatchMode: fail instead of asking for a passphrase (a background ssh asking would just hang).
   SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20)
-  "${SSH[@]}" "$LUMI_HOST" true \
-    || die "cannot ssh to $LUMI_HOST without a prompt. Load your key into an agent first: eval \"\$(ssh-agent)\"; ssh-add ~/.ssh/<lumi key> (and accept the host key once with a plain ssh $LUMI_HOST). See docs/harbor_tilde.md, steps 0b and 0c"
+  # ControlPath=none: test a fresh login, like the tunnel's below. A shared ControlMaster connection from
+  # ~/.ssh/config would pass even without the key in ssh-agent, and the tunnel would then fail.
+  "${SSH[@]}" -o ControlPath=none "$LUMI_HOST" true \
+    || die "cannot ssh to $LUMI_HOST without a prompt. Load your key into an agent first: eval \"\$(ssh-agent)\"; ssh-add ~/.ssh/<lumi key> (and accept the host key once with a plain ssh $LUMI_HOST). See docs/harbor_tilde.md, step 3a"
 
   # Prints "<run folder or -> <router URL or -> <job state: PENDING, RUNNING, ..., or GONE>".
   lumi_lookup() {
@@ -168,7 +170,7 @@ fi
 for (( try = 1; ; try++ )); do
   MODELS=$(curl -sS --fail-with-body --max-time 10 -H "Authorization: Bearer $API_KEY" "$URL/models" 2>&1) && break
   if [ -n "${TUNNEL_PID:-}" ] && ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-    die "the ssh tunnel exited (local port $LOCAL_PORT in use? pass --local-port; 'administratively prohibited' = the login node forbids forwarding)"
+    die "the ssh tunnel exited, see the ssh error above: 'Permission denied' = key not in ssh-agent (docs/harbor_tilde.md step 3a); 'Address already in use' = local port $LOCAL_PORT taken (pass --local-port); 'administratively prohibited' = the login node forbids forwarding"
   fi
   (( try < 6 )) || die "$URL/models failed (LUMI job ended? wrong API key?): $MODELS"
   sleep 5

@@ -3,7 +3,7 @@
 Harbor runs the agent loop and the Docker sandboxes on **Tilde**. The model is a vLLM server on **LUMI**.
 They are connected by an ssh tunnel through a LUMI login node to a vllm-router, which spreads the requests over
 all vLLM servers of the job:
-`Tilde 127.0.0.1:18000 --ssh--> lumi-uan01.csc.fi --> <first node>:9000 (router) --> <all nodes>:8000..`.
+`Tilde 127.0.0.1:18000 --ssh--> LUMI login node --> <first node>:9000 (router) --> <all nodes>:8000..`.
 `tilde/harbor_run.sh` opens and closes the tunnel itself.
 
 Where things live (Tilde, inside the repo, both gitignored):
@@ -47,7 +47,8 @@ git clone <repo> && cd rl-rollgen
 bash tilde/install.sh                       # uv + harbor 0.20.0; checks that docker works
 ```
 
-**3. An ssh key from Tilde to LUMI.** Skip this if `ssh <lumi user>@lumi-uan01.csc.fi` already works from Tilde.
+**3. An ssh key from Tilde to LUMI.** Skip this if you already have one on Tilde (e.g. `~/.ssh/id_rsa`) that LUMI
+accepts.
 
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/id_lumi     # choose a passphrase
@@ -57,55 +58,40 @@ cat ~/.ssh/id_lumi.pub
 Add the public key to your LUMI account the same way you added your laptop's key (LUMI docs: "Setting up SSH key
 pair"). It can take a while before LUMI accepts it.
 
-**4. Tell ssh your LUMI user name and key**, so you don't have to pass them every time. Add this to
-`~/.ssh/config` on Tilde:
+**4. A short name for LUMI.** Add this to `~/.ssh/config` on Tilde (use your key from step 3):
 
 ```
-Host lumi-uan01.csc.fi
+Host lumi
+    HostName lumi.csc.fi
     User <lumi user>
     IdentityFile ~/.ssh/id_lumi
+    IdentitiesOnly yes
 ```
 
-If you already have a `Host` alias for LUMI (e.g. `Host lumi` with `HostName lumi.csc.fi`), you don't need this
-block. Pass `--lumi-host lumi` to `harbor_run.sh` instead, and use `lumi` for `lumi-uan01.csc.fi` in the commands
-below. `ControlMaster` in your config is fine: the tunnel opens its own connection anyway.
+All commands below use this name: `ssh lumi`, and `--lumi-host lumi` for `harbor_run.sh`. Extra lines like
+`ControlMaster` are fine: `harbor_run.sh` opens its own connection for the tunnel anyway.
 
 **5. Log in once by hand.** Answer `yes` to the host key question and type the passphrase. `harbor_run.sh`
 can't answer either of them.
 
 ```bash
-ssh lumi-uan01.csc.fi hostname              # -> uan01
+ssh lumi hostname                           # -> uan01 (or another login node)
 ```
 
 **6. Copy the API key from LUMI to Tilde.** This is the key you created in step 0a.3. Both sides need the same
 key: the servers on LUMI check it, and `harbor_run.sh` on Tilde sends it (it reads `~/.vllm_key` by default).
 
 ```bash
-scp lumi-uan01.csc.fi:.vllm_key ~/.vllm_key && chmod 600 ~/.vllm_key
-diff <(ssh lumi-uan01.csc.fi cat .vllm_key) ~/.vllm_key && echo "same key on both sides"
+scp lumi:.vllm_key ~/.vllm_key && chmod 600 ~/.vllm_key
+diff <(ssh lumi cat .vllm_key) ~/.vllm_key && echo "same key on both sides"
 ```
 
 If you ever make a new key on LUMI, copy it again. With different keys, `harbor_run.sh` stops with
 "`.../models` failed (... wrong API key?)".
 
-## 0c. Every time you log in to Tilde
-
-Harbor jobs run for hours, so run them in **tmux**: the job keeps running when you disconnect.
-`harbor_run.sh` talks to LUMI over ssh and can't type your passphrase, so load the key into an **ssh-agent**
-in the tmux window where you will run it:
-
-```bash
-tmux new -s harbor                          # later: tmux attach -t harbor (after a disconnect)
-eval "$(ssh-agent)"                         # once per tmux window
-ssh-add -t 12h ~/.ssh/id_lumi               # asks for the passphrase; the key is forgotten after 12 h
-ssh -o BatchMode=yes lumi-uan01.csc.fi true && echo "ssh ok"   # what harbor_run.sh needs
-```
-
-When the 12 hours are up, a running job is not affected: its tunnel is already open. Before the next
-`harbor_run.sh` in that window, run `ssh-add -t 12h ~/.ssh/id_lumi` again. If `harbor_run.sh` says
-"cannot ssh to ... without a prompt", this is the step that is missing.
-
 ## 1. Download a dataset (Tilde)
+
+Takes seconds to minutes; no tmux or ssh-agent needed (doing it in the tmux window of step 3 is fine too).
 
 ```bash
 harbor datasets list --legacy               # what is available
@@ -116,6 +102,8 @@ ls data/harbor/terminal-bench@2.0/<task>    # instruction.md, task.toml, environ
 Always pin the version. To change tasks, edit them in place or copy the folder under a new name.
 
 ## 2. Serve the model (LUMI)
+
+On a LUMI login node. No tmux needed: `sbatch` returns at once and the job runs without you.
 
 ```bash
 cd /scratch/project_465003062/<you>/rl-rollgen && git pull
@@ -130,12 +118,34 @@ across the trial's turns. Router log: `logs/<run>/router.log`.
 
 ## 3. Run Harbor (Tilde, in tmux)
 
+### 3a. Open tmux and load your ssh key (every time you log in to Tilde)
+
+Harbor jobs run for hours, so run them in **tmux**: the job keeps running when you disconnect.
+
+`harbor_run.sh` logs in to LUMI over ssh several times, and it **can't type your key's passphrase**. So first put
+the key into an **ssh-agent**, in the same tmux window where you will run `harbor_run.sh`:
+
 ```bash
-tilde/harbor_run.sh --path data/harbor/terminal-bench@2.0 --n-tasks 5 --n-attempts 4 \
-  --lumi-repo /scratch/project_465003062/<you>/rl-rollgen --lumi-run <jobid>
+tmux new -s harbor                          # after a disconnect: tmux attach -t harbor
+eval "$(ssh-agent)"                         # once per tmux window
+ssh-add -t 12h ~/.ssh/id_lumi               # type the passphrase here; the agent forgets it after 12 h
+ssh -o BatchMode=yes -o ControlPath=none lumi true && echo ok   # must print "ok" without asking anything
 ```
 
-The user name comes from `~/.ssh/config` (step 0b.4). Without that, pass `--lumi-host <lumi user>@lumi-uan01.csc.fi`.
+Don't start the run until the last line prints `ok`. If it says `Permission denied (publickey)`, the key is not in
+the agent of *this* window. Run the `eval` and `ssh-add` lines again here. `ssh-add -l` shows which keys the agent
+holds. With `IdentitiesOnly yes`, it must be the key named in `~/.ssh/config`.
+
+The agent belongs to the window it was started in. A new tmux window needs its own `eval` and `ssh-add`.
+After 12 hours, a running job is not affected, because its tunnel is already open. Before the next run, repeat
+`ssh-add -t 12h ~/.ssh/id_lumi`.
+
+### 3b. Run
+
+```bash
+tilde/harbor_run.sh --path data/harbor/terminal-bench@2.0 --n-tasks 5 --n-attempts 4 \
+  --lumi-host lumi --lumi-repo /scratch/project_465003062/<you>/rl-rollgen --lumi-run <jobid>
+```
 
 The script:
 1. Waits for the LUMI job's router: queue time plus vLLM startup, up to `--wait` minutes (default 60).
@@ -173,7 +183,8 @@ If any are left, `docker rm -f` them.
 **Resume** a stopped job. This works with the same or a new serve job, as long as it serves the same model:
 
 ```bash
-tilde/harbor_run.sh --resume <job-name> --lumi-host ... --lumi-repo ... --lumi-run <jobid>
+tilde/harbor_run.sh --resume <job-name> \
+  --lumi-host lumi --lumi-repo /scratch/project_465003062/<you>/rl-rollgen --lumi-run <jobid>
 ```
 
 This keeps finished trials and reruns the cancelled ones. The job's settings come from its `config.json`.
