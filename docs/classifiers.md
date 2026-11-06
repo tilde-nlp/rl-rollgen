@@ -31,7 +31,14 @@ Output: a sidecar `.jsonl`, one line per input record:
   reply itself is included).
 - Records that `messages()` skips (returns `None`) get no line.
 
-The input is streamed (files of many GB are fine). Identical requests are sent once per run. A killed job is
+The input is streamed (files of many GB are fine). Identical requests are sent once per run.
+
+Several files in one job (the model starts once): `--input a.jsonl b.jsonl ... --output-suffix .difficulty.jsonl`
+writes each file's labels next to it (`a.jsonl` -> `a.difficulty.jsonl`, each with its own `.meta.json`). All
+files are checked before anything is sent (record 0, `--keep-fields`, resume settings), then classified one
+after another. A timed-out job is resumed by resubmitting the same command (finished files are skipped
+quickly); one file resumes the same way with `--input a.jsonl --output a.difficulty.jsonl`.
+Example: `configs/runs/classify_sft_stage1.sh`. A killed job is
 resumed by resubmitting the same command; resuming with other settings or an edited classifier is refused.
 
 ## Writing a classifier

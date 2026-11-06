@@ -18,6 +18,7 @@ Example:
 
 import argparse
 import json
+import sys
 
 from _common import add_server_args, get_messages, read_records, run_resumable
 
@@ -64,7 +65,7 @@ def main():
             for ch in resp.choices
         ]
 
-    run_resumable(tasks, worker, args, "task_idx")
+    sys.exit(0 if run_resumable(tasks, worker, args, "task_idx") else 1)
 
 
 if __name__ == "__main__":

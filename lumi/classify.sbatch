@@ -54,10 +54,13 @@
 #     --router-policy NAME      how vllm-router spreads requests over the servers: round_robin (default),
 #                               cache_aware, random, power_of_two, consistent_hash
 #   rollgen/classify.py flags (passed through):
-#     --input FILE              (required) records .jsonl/.parquet (streamed: many GB is fine)
-#     --output FILE             (required) labels .jsonl, one line per record (record_idx + kept fields +
+#     --input FILE [FILE ...]   (required) records .jsonl/.parquet (streamed: many GB is fine). Several
+#                               files: checked first, then classified one after another (one vLLM startup)
+#     --output FILE             labels .jsonl, one line per record (record_idx + kept fields +
 #                               labels + classify_error); an existing file is resumed, same settings only
 #                               (--concurrency may differ; an edited classifier counts as different)
+#     --output-suffix SUFFIX    instead of --output (needed for several inputs): each input's labels go
+#                               next to it, a.jsonl -> a<SUFFIX>, e.g. .difficulty.jsonl
 #     --classifier NAME         (required) a folder in configs/classifiers/ (e.g. difficulty) or a path,
 #                               with config.py (Output + messages(record)); see docs/classifiers.md
 #     --keep-fields A,B         input fields copied to every output line, e.g. uuid (to join on)

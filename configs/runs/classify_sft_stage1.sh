@@ -1,0 +1,50 @@
+#!/bin/bash
+# Difficulty labels (configs/classifiers/difficulty) for the SFT stage-1 candidates, judged by Qwen3-32B.
+# File list copied on 2026-11-06 from /scratch/project_465003062/data/tilde-think/sft-stage1-candidates.txt.
+# ONE job for all files (vLLM starts once); the labels go next to each input:
+#   <name>.jsonl -> <name>.difficulty.jsonl (+ <name>.difficulty.jsonl.meta.json)
+#
+# Usage (login node, from anywhere; it cds to the repo root):
+#   bash configs/runs/classify_sft_stage1.sh --check   only check every file (record 0 through the
+#                                                      classifier); no job
+#   bash configs/runs/classify_sft_stage1.sh           check, then submit the job
+# Timed out? Run it again: finished files and records are skipped.
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+source lumi/_common.sh   # SIF, BINDS, run_in_container (for the check)
+
+DATA=/scratch/project_465003062/data/tilde-think
+# vLLM/Inductor/Triton/MIOpen compile caches kept across jobs (the first job fills it, later ones start faster)
+COMPILE_CACHE=/scratch/project_465003062/environment/rollgen-compile-cache
+FILES=(
+    _merged/math/all.reason.no_tools.jsonl
+    _merged/math/all.reason.tools.jsonl
+    _merged/science/rqa.reason.no_tools.jsonl
+    _merged/science/rqa.reason.tools.jsonl
+    _merged/science/so.reason.no_tools.jsonl
+    _merged/science/so.reason.tools.jsonl
+    _merged/science/syn_mcq.reason.no_tools.jsonl
+    _merged/science/syn_mcq.reason.tools.jsonl
+    _merged/science/vendor.reason.no_tools.jsonl
+    _merged/coding-v2/competitive_programming_cpp.reason.no_tools.jsonl
+    _merged/coding-v2/competitive_programming_python.reason.no_tools.jsonl
+    _merged/coding-v2/text_to_sql.reason.no_tools.jsonl
+    _merged/infinibyte/all.reason.no_tools.jsonl
+    _merged/finance-doc/all.reason.no_tools.jsonl
+    _merged/arc/raw/small_reasoning_and_tools.jsonl
+    _merged/arc/raw/small_reasoning_no_tools.jsonl
+    _merged/agentic-v4/raw/tool_calling.jsonl
+)
+INPUTS=("${FILES[@]/#/$DATA/}")
+ARGS=(--input "${INPUTS[@]}" --output-suffix .difficulty.jsonl
+      --classifier difficulty
+      --extra-body '{"chat_template_kwargs": {"enable_thinking": false}}')
+
+# 1. Check every file before submitting (a missing field or another record shape shows up here,
+#    not after waiting in the queue). The job checks again at start, before vLLM loads.
+run_in_container python rollgen/classify.py --check-args "${ARGS[@]}"
+[ "${1:-}" = "--check" ] && exit 0
+
+# 2. Submit. 4 nodes x 2 servers (TP=4) = 8 Qwen3-32B servers behind the router.
+sbatch -p standard-g --nodes=4 --time=24:00:00 lumi/classify.sbatch --model Qwen/Qwen3-32B --tp 4 \
+    --compile-cache "$COMPILE_CACHE" "${ARGS[@]}"

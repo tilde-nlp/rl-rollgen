@@ -25,6 +25,7 @@ Example:
 
 import argparse
 import json
+import sys
 
 from _common import add_server_args, count_records, iter_records, read_growing_jsonl, resolve_config, run_resumable
 from _ask import Config
@@ -72,13 +73,14 @@ def main():
 
     record = judge.record("judge")
     if args.follow:
-        run_resumable(load_growing(), worker, args, "rollout_idx", record=record,
-                      follow=(load_growing, args.input + ".meta.json", args.follow_timeout))
+        ok = run_resumable(load_growing(), worker, args, "rollout_idx", record=record,
+                           follow=(load_growing, args.input + ".meta.json", args.follow_timeout))
     else:
         first = next(rollouts(), None)
         if first is not None:
             judge.check_record(first, f"{args.input} record 0")  # fail fast, before sending anything
-        run_resumable(rollouts(), worker, args, "rollout_idx", record=record, total=count_records(args.input))
+        ok = run_resumable(rollouts(), worker, args, "rollout_idx", record=record, total=count_records(args.input))
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

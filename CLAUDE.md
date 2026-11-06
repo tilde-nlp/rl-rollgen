@@ -175,7 +175,15 @@ Sbatch files must be submitted from the repo root (they use `$SLURM_SUBMIT_DIR`)
   stops when the newest run in `<input>.meta.json` finished after the judge started, or after `--follow-timeout`
   minutes without new lines (then exit 1, run marked `incomplete`). Failed items aren't retried within one run.
 - classify.py: sidecar lines in completion order with `record_idx`, `classify_error`, failed server requests
-  are retried on rerun, thinking off via `--extra-body`. Dedups identical requests (sha1 of messages).
+  are retried on rerun, thinking off via `--extra-body`. Dedups identical requests (sha1 of messages; only
+  after a reply, so identical requests in flight at the same time are both sent; errors aren't cached).
+- Multi-file classify (decided 2026-11-06: owner rejected one job per file because every job pays the vLLM
+  startup): `--input A B ... --output-suffix .difficulty.jsonl` -> outputs next to inputs, one job. All files
+  checked first (record 0, keep fields, start_meta dry run), then run_resumable per file in sequence (short
+  concurrency drain between files, accepted). Per-file Namespace (input/output = that file, no output_suffix)
+  so meta.json settings equal a single-file run's (either form resumes the other; adding files to the list
+  doesn't block resuming). Dedup cache shared across files. run_resumable now returns ok instead of
+  sys.exit (callers exit 1). Only classify.py has this; judge.py doesn't (yet).
 - Client throughput (measured with the old engine): ~450 req/s per process, CPU-bound in the openai client;
   memory flat on large inputs (672 MB input -> 133 MB RSS).
 - Tested locally (2026-11-06) with a fake vLLM server: classify on plain/Nemotron/chat records, dedup, error

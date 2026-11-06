@@ -218,13 +218,15 @@ def run_resumable(items, worker, args, key, record=None, follow=None, total=None
 
     follow=(load, producer_meta, timeout_min): the input is still being written by another job
     (e.g. judging while generating). See _follow.
+
+    Returns True if every item succeeded (and, with follow, the producer finished); callers exit 1 otherwise.
     """
     if total is None and hasattr(items, "__len__"):
         total = len(items)
     if args.check_args:
         start_meta(args, dry_run=True, record=record)
         print(f"arguments OK ({total if total is not None else '?'} items)")
-        sys.exit(0)
+        return True
     n_loops = args.concurrency * args.servers
     client = make_client(args, n_loops)
     output = Path(args.output)
@@ -238,8 +240,7 @@ def run_resumable(items, worker, args, key, record=None, follow=None, total=None
         n_ok, n_fail, n_skip = asyncio.run(_run(items, worker, output, key, client, n_loops, done, total))
     finish_meta(meta_path, meta, items_ok=n_ok, items_failed=n_fail, items_skipped=n_skip,
                 **({} if complete else {"incomplete": True}))
-    if n_fail or not complete:
-        sys.exit(1)
+    return not n_fail and complete
 
 
 def _producer_finished(meta_path, since):
