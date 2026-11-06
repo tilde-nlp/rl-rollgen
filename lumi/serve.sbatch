@@ -57,6 +57,9 @@
 #                               faster (default: node-local /tmp, recompiled every job)
 #     --api-key-file FILE       servers require the key in FILE (one line, chmod 600); without it anyone on
 #                               the LUMI network can use them while the job runs
+#     --router-policy NAME      how vllm-router spreads requests: cache_aware (default here: requests sharing a
+#                               prompt prefix, like the turns of one agent trial, stay on one server),
+#                               round_robin, random, power_of_two, consistent_hash
 #   No other flags: this job runs no client.
 #
 # All flags:  bash lumi/serve.sbatch --help     (works on a login node)
@@ -68,11 +71,11 @@ REPO="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 source "$REPO/lumi/_common.sh"
 
 init_run_dir
+DEFAULT_ROUTER_POLICY=cache_aware   # agent trials: keep each trial's turns on one server (prefix cache)
 parse_launcher_args "" "$@"
-[ -d "$ROUTER_DIR/vllm_router" ] || die "vllm-router not installed: run 'bash lumi/install_router.sh' once on a login node"
 record_run lumi/serve.sbatch "$@"
 start_vllm_servers
 start_router
-echo "serving at $ROUTER_URL until the time limit or scancel $SLURM_JOB_ID (tilde/harbor_run.sh --lumi-run $SLURM_JOB_ID)"
+echo "serving at $VLLM_URL until the time limit or scancel $SLURM_JOB_ID (tilde/harbor_run.sh --lumi-run $SLURM_JOB_ID)"
 wait -n "$SERVERS_PID" "$ROUTER_PID" || true
 die "vLLM servers or vllm-router exited, see $RUN_DIR (router.log, *-vllm-*.log)"

@@ -12,7 +12,9 @@
 #SBATCH --output=logs/%x-%j.out
 #
 # Score rollouts with a judge model: starts the judge in vLLM on every node of the allocation,
-# then runs rollgen/judge.py once (on the first node) against all servers.
+# then runs rollgen/judge.py once (on the first node) through a vllm-router in front of all servers.
+#
+# Once per clone, on a login node:  bash lumi/install_router.sh
 #
 # Submit from the repo root:
 #   sbatch --nodes=2 lumi/judge.sbatch --model /scratch/.../judge-model --tp 4 \
@@ -50,6 +52,8 @@
 #                               faster (default: node-local /tmp, recompiled every job)
 #     --api-key-file FILE       servers require the key in FILE (one line, chmod 600); without it anyone on
 #                               the LUMI network can use them while the job runs
+#     --router-policy NAME      how vllm-router spreads requests over the servers: round_robin (default),
+#                               cache_aware, random, power_of_two, consistent_hash
 #   rollgen/judge.py flags (passed through):
 #     --input FILE              (required) rollouts .jsonl/.parquet from generate (still growing with --follow)
 #     --output FILE             (required) judged .jsonl; an existing file is resumed, same settings only
@@ -62,8 +66,8 @@
 #     --follow                  judge while generation is still writing --input (start with
 #                               --dependency=after:JOBID); stops when that generation run finishes
 #     --follow-timeout MIN      with --follow: give up after MIN minutes without new rollouts (default: 60)
-#     --concurrency N           max in-flight requests per server (default: 64)
-#     (--urls is filled in by the launcher: all servers of this job)
+#     --concurrency N           max in-flight requests per server (default: 64; in total x servers)
+#     (--url and --servers are filled in by the launcher: the router and the number of servers)
 #
 # All flags:  bash lumi/judge.sbatch --help     (works on a login node)
 # Logs:       logs/latest_run/ (slurm.out, run.txt, vLLM logs); run record also in <output>.meta.json
@@ -77,4 +81,5 @@ init_run_dir
 parse_launcher_args rollgen/judge.py "$@"
 record_run lumi/judge.sbatch "$@"
 start_vllm_servers
+start_router
 run_in_container python "$REPO/rollgen/judge.py" "${CLIENT_ARGS[@]}"

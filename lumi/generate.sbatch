@@ -12,7 +12,9 @@
 #SBATCH --output=logs/%x-%j.out
 #
 # Generate rollouts with the policy model: starts vLLM on every node of the allocation, then runs
-# rollgen/generate.py once (on the first node) against all servers.
+# rollgen/generate.py once (on the first node) through a vllm-router in front of all servers.
+#
+# Once per clone, on a login node:  bash lumi/install_router.sh
 #
 # Submit from the repo root:
 #   sbatch --nodes=4 lumi/generate.sbatch --model /scratch/.../my-model --tp 2 \
@@ -46,6 +48,8 @@
 #                               faster (default: node-local /tmp, recompiled every job)
 #     --api-key-file FILE       servers require the key in FILE (one line, chmod 600); without it anyone on
 #                               the LUMI network can use them while the job runs
+#     --router-policy NAME      how vllm-router spreads requests over the servers: round_robin (default),
+#                               cache_aware, random, power_of_two, consistent_hash
 #   rollgen/generate.py flags (passed through):
 #     --input FILE              (required) prompts, .jsonl or .parquet (format: docs/data.md)
 #     --output FILE             (required) rollouts .jsonl; an existing file is resumed (finished prompts
@@ -56,8 +60,8 @@
 #     --max-tokens N            max completion tokens (default: 2048)
 #     --extra-body JSON         extra sampling params for vLLM, e.g. '{"top_k": 50, "min_p": 0.05}' or
 #                               '{"chat_template_kwargs": {"enable_thinking": false}}'
-#     --concurrency N           max in-flight requests per server (default: 64)
-#     (--urls is filled in by the launcher: all servers of this job)
+#     --concurrency N           max in-flight requests per server (default: 64; in total x servers)
+#     (--url and --servers are filled in by the launcher: the router and the number of servers)
 #
 # All flags:  bash lumi/generate.sbatch --help     (works on a login node)
 # Logs:       logs/latest_run/ (slurm.out, run.txt, vLLM logs); run record also in <output>.meta.json
@@ -71,4 +75,5 @@ init_run_dir
 parse_launcher_args rollgen/generate.py "$@"
 record_run lumi/generate.sbatch "$@"
 start_vllm_servers
+start_router
 run_in_container python "$REPO/rollgen/generate.py" "${CLIENT_ARGS[@]}"

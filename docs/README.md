@@ -5,6 +5,7 @@ Generate RL rollouts with self-hosted vLLM and score them with an LLM judge, on 
 - [lumi.md](lumi.md): quickstart on LUMI (generate, judge, rescore, serve)
 - [data.md](data.md): input format, output fields, `meta.json` and `logs/` run records
 - [judges.md](judges.md): writing a judge (`prompt.txt` + `rubric.toml`), judging while generating
+- [classifiers.md](classifiers.md): labeling datasets (e.g. difficulty of each prompt), same folder format
 - [harbor_tilde.md](harbor_tilde.md): multi-step agent rollouts with Harbor on Tilde, model served from LUMI
 
 Tilde (one-step): Not yet available.
@@ -16,6 +17,7 @@ lumi/           LUMI launchers (sbatch)
 tilde/          Tilde launchers
 rollgen/        the Python that does the work, same on both clusters
 judges/         judge prompts + rubrics, one folder per judge
+classifiers/    classifier prompts + label definitions, one folder per classifier
 examples/       small example inputs
 runs/           per-experiment launch scripts (bash runs/<name>.sh)
 docs/           documentation

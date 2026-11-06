@@ -1,0 +1,24 @@
+# Domain, task type and difficulty of a question (with its reference answer), plus whether the
+# tools offered with it are needed. The detailed rubric is in system.txt; the questions below
+# only document the fields (the prompt has no {criteria}).
+# Made for Nemotron-RL-style records: problem, expected_answer, responses_create_params.tools.
+# Run: rollgen/classify.py --classifier classifiers/difficulty --keep-fields uuid \
+#        --extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'
+reasoning = false        # reply with the labels only
+max_field_chars = 12000  # longer problems / answers are cut (head and tail kept)
+
+# Order matters: fields are generated top to bottom, so the model has classified the request
+# before it judges difficulty.
+[criteria]
+domain = { type = "enum", question = "The main subject knowledge needed.", values = [
+    "math", "programming", "physics", "chemistry", "biology", "medicine", "finance_economics",
+    "law", "humanities", "abstract_reasoning", "everyday", "other",
+] }
+task_type = { type = "enum", question = "The kind of work requested.", values = [
+    "proof", "problem_solving", "algorithm", "software_engineering", "query_writing", "conceptual_qa",
+    "multiple_choice", "document_analysis", "tool_use", "writing", "pattern_induction", "other",
+] }
+difficulty = { type = "enum", question = "The expertise needed to produce a fully correct, complete answer.", values = [
+    "easy", "medium", "hard", "expert",
+] }
+tools_needed = { type = "bool", when = "responses_create_params[tools]", question = "Does a fully correct answer practically require calling one of the tools?" }

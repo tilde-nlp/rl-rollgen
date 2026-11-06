@@ -1,18 +1,19 @@
 """Score rollouts with an LLM judge served by vLLM.
 
 Input: rollouts .jsonl (e.g. from generate.py), one rollout per line, or .parquet.
-Judge: a folder judges/<name>/ with prompt.txt and rubric.toml (see rollgen/_rubric.py and
-judges/). The judge answers each rubric question as JSON; the reward is then computed from
-those answers with the rubric's formula. Change the formula later without re-judging:
-rollgen/rescore.py.
+Judge: a folder judges/<name>/ with prompt.txt (or prompt.json), rubric.toml and optionally
+system.txt (see rollgen/_rubric.py and docs/judges.md). The judge answers each rubric question as
+JSON; the reward is then computed from those answers with the rubric's formula. Change the formula
+later without re-judging: rollgen/rescore.py.
 
-{prompt} in prompt.txt: if a rollout has its prompt as chat messages ("messages", or "prompt"
+{prompt} in the prompt: if a rollout has its prompt as chat messages ("messages", or "prompt"
 as a list), it is the last user message.
 
 Output JSONL, one line per rollout:
   <rollout fields> + rollout_idx (input record number), judge_output (raw reply),
-  judge_scores ({criterion: answer}), reward, judge_error (null, or why the reply was unusable;
-  then judge_scores and reward are null)
+  judge_scores ({criterion: answer}), reward, judge_error (null, or why there is no usable reply,
+  e.g. a missing prompt field; then judge_scores and reward are null. If only the reward formula
+  failed, judge_scores are kept: fix the formula and run rescore.py)
 
 Judge while generating (--follow): start this job while generate.py is still writing --input;
 new rollouts are judged as they appear (checked every 30s). Stops when the generation run
@@ -20,7 +21,7 @@ finishes (per <input>.meta.json), or after --follow-timeout minutes with no new 
 Needs a .jsonl input.
 
 Resumable: rerun with the same arguments and finished rollouts are skipped.
-Each run is recorded in <output>.meta.json, including the judge's prompt.txt and rubric.toml.
+Each run is recorded in <output>.meta.json, including the judge folder's files.
 
 Example:
   python rollgen/judge.py --input rollouts.jsonl --output judged.jsonl --judge judges/correctness
@@ -29,8 +30,8 @@ Example:
 import argparse
 import json
 
-from _common import add_server_args, get_messages, read_jsonl, read_records, run_resumable
-from _rubric import Judge
+from _common import add_server_args, count_records, iter_records, read_growing_jsonl, run_resumable
+from _rubric import Rubric
 
 
 def main():
@@ -52,46 +53,39 @@ def main():
     if args.follow and not args.input.endswith(".jsonl"):
         p.error("--follow needs a .jsonl --input")
 
-    judge = Judge(args.judge)
+    judge = Rubric(args.judge, need_reward=True)
     judge.check_reward()
-    criteria = judge.criteria_text()
 
-    def load():
-        records = read_jsonl(args.input, growing=True) if args.follow else read_records(args.input)
-        for i, r in enumerate(records):
-            r["rollout_idx"] = i  # line number: stable, since generate.py only appends
+    def rollouts():
+        # rollout_idx = record number: stable, since generate.py only appends
+        return ({**r, "rollout_idx": i} for i, r in enumerate(iter_records(args.input)))
+
+    def load_growing():
+        records = [{**r, "rollout_idx": i} for i, r in enumerate(read_growing_jsonl(args.input))]
         if records:
-            render(records[0])  # fail fast on a bad prompt, before sending anything
+            judge.check_record(records[0], f"{args.input} record 0")
         return records
 
-    def render(r):
-        fields = dict(r)
-        if not isinstance(fields.get("prompt"), str):
-            messages = get_messages(r) or []
-            fields["prompt"] = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
-        fields["criteria"] = criteria
-        try:
-            return judge.prompt.format_map(fields)
-        except KeyError as e:
-            raise SystemExit(f"prompt.txt placeholder {e} not found in rollout fields: {sorted(fields)}")
-
     async def worker(r, client):
-        resp = await client.chat.completions.create(
-            model=args.served_name,
-            messages=[{"role": "user", "content": render(r)}],
-            temperature=args.temperature,
-            max_tokens=args.max_tokens,
-            response_format=judge.response_format(),
-            extra_body=args.extra_body,
-        )
-        text = resp.choices[0].message.content or ""
-        scores, error = judge.parse(text)
-        reward = judge.reward(scores) if scores is not None else None
+        scores, text, error = await judge.ask(client, args.served_name, r, args.temperature,
+                                              args.max_tokens, args.extra_body)
+        reward = None
+        if scores is not None:
+            try:
+                reward = judge.reward(scores)
+            except Exception as e:  # scores are kept: fix the formula, then rollgen/rescore.py
+                error = f"reward formula failed: {type(e).__name__}: {e}"
         return [{**r, "judge_output": text, "judge_scores": scores, "reward": reward, "judge_error": error}]
 
-    run_resumable(load(), worker, args, "rollout_idx",
-                  record={"judge_prompt": judge.prompt, "judge_rubric": judge.rubric_text},
-                  follow=(load, args.input + ".meta.json", args.follow_timeout) if args.follow else None)
+    record = judge.record("judge")
+    if args.follow:
+        run_resumable(load_growing(), worker, args, "rollout_idx", record=record,
+                      follow=(load_growing, args.input + ".meta.json", args.follow_timeout))
+    else:
+        first = next(rollouts(), None)
+        if first is not None:
+            judge.check_record(first, f"{args.input} record 0")  # fail fast, before sending anything
+        run_resumable(rollouts(), worker, args, "rollout_idx", record=record, total=count_records(args.input))
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 #!/bin/bash
 # One-time, on a LUMI login node: install vllm-router into lumi/vllm-router/ (gitignored).
-# lumi/serve.sbatch runs it in front of all vLLM servers of a job, so outside clients (Harbor on Tilde)
-# need only one URL.
+# Every lumi/*.sbatch job runs it in front of all its vLLM servers: the client (rollgen/*.py, or Harbor on
+# Tilde for serve.sbatch) talks to one URL and the router spreads the requests.
 #
 #   bash lumi/install_router.sh
 #

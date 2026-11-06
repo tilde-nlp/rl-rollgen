@@ -2,7 +2,8 @@
 
 
 ```bash
-git clone <repo> && cd rl-rollgen      # nothing to install; always submit from the repo root
+git clone <repo> && cd rl-rollgen      # always submit from the repo root
+bash lumi/install_router.sh            # once per clone, on a login node: vllm-router (see below)
 
 # 1. generate: 8 samples per prompt, vLLM on 4 nodes, TP=2
 sbatch --nodes=4 lumi/generate.sbatch --model /scratch/.../policy-model --tp 2 \
@@ -15,6 +16,14 @@ sbatch --nodes=2 lumi/judge.sbatch --model /scratch/.../judge-model --tp 4 \
 # 3. changed the reward formula in judges/correctness/rubric.toml? recompute, no GPUs needed
 #    (needs Python >= 3.11; on a LUMI login node: module load cray-python)
 python3 rollgen/rescore.py --input data/judged.jsonl --output data/judged_v2.jsonl --judge judges/correctness
+```
+
+Label a dataset (e.g. difficulty of each prompt; see [classifiers.md](classifiers.md)):
+```bash
+sbatch --nodes=2 lumi/classify.sbatch --model /scratch/.../gemma-4-12B-it \
+    --input data/so_openq.jsonl --output data/so_openq.difficulty.jsonl \
+    --classifier classifiers/difficulty --keep-fields uuid \
+    --extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'
 ```
 
 Run the judge right after generation:
@@ -33,6 +42,7 @@ All flags:
 ```bash
 bash lumi/generate.sbatch --help
 bash lumi/judge.sbatch --help
+bash lumi/classify.sbatch --help
 ```
 
 Keep a model served for clients outside the job (e.g. Harbor on Tilde), until `--time` runs out or `scancel`:
@@ -41,8 +51,13 @@ Keep a model served for clients outside the job (e.g. Harbor on Tilde), until `-
 sbatch --nodes=2 --time=04:00:00 lumi/serve.sbatch --model Qwen/Qwen3-32B --tp 4 --api-key-file ~/.vllm_key
 cat logs/latest_run/urls/router.txt                    # one URL for all servers (vllm-router), gone when the job ends
 ```
-Once per clone, before the first serve job: `bash lumi/install_router.sh` (on a login node).
-`--api-key-file` works for generate/judge too.
+`--api-key-file` works for generate/judge/classify too.
+
+Every job puts its vLLM servers (on all nodes) behind one vllm-router on the first node; the Python script, or a
+client outside the job, talks only to the router. `--router-policy` sets how it spreads the requests:
+`round_robin` (default), `cache_aware` (default of serve.sbatch: requests sharing a prompt prefix, like the turns
+of one agent trial, stay on one server and reuse its prefix cache). `--concurrency` stays per server: the script
+keeps `concurrency x number of servers` requests in flight.
 
 `--model` takes a model directory or a Hugging Face id already downloaded to the shared HF cache
 (`/scratch/project_465003062/environment/containers/fsdp-skyrl-harbor/hf`), e.g. `--model Qwen/Qwen3-32B`.

@@ -1,9 +1,10 @@
-"""Small helpers shared by the scripts in this folder: JSONL I/O, vLLM clients, and a
+"""Small helpers shared by the scripts in this folder: JSONL/parquet I/O, the vLLM client, and a
 resumable async loop that writes results as they finish.
 
-Scripts here never know which cluster they run on. They get vLLM endpoints from
---urls or the VLLM_URLS env var (comma-separated, e.g. "http://127.0.0.1:8000/v1"),
-which the cluster launchers (lumi/, tilde/) set.
+Scripts here never know which cluster they run on. They talk to one OpenAI-compatible URL
+(--url or $VLLM_URL): a single vLLM server, or a vllm-router that spreads the requests over many
+servers. The LUMI launchers start the router in front of all servers of a job and set VLLM_URL,
+VLLM_SERVERS (how many servers are behind it) and SERVED_NAME.
 
 Every run is recorded in <output>.meta.json (arguments, model, git commit, timing). Resuming into
 an existing output with different arguments is refused, so one file never mixes settings.
@@ -22,34 +23,59 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 # Args that may differ between resumed runs without changing what the output contains.
-RESUME_SAFE_ARGS = {"urls", "concurrency", "check_args", "follow", "follow_timeout"}
+RESUME_SAFE_ARGS = {"url", "servers", "concurrency", "check_args", "follow", "follow_timeout"}
 FOLLOW_POLL_SECONDS = 30
+PROGRESS_SECONDS = 30  # print progress at most this often
 
 
-def read_jsonl(path, growing=False):
-    """growing=True: the file may still be being written by another job, so a missing file
-    is empty and an unfinished last line (no trailing newline yet) is left for later."""
+def read_growing_jsonl(path):
+    """Records of a .jsonl that another job may still be writing: a missing file is empty, and an
+    unfinished last line (no trailing newline yet) is left for later."""
     if not Path(path).is_file():
-        if growing:
-            return []
-        sys.exit(f"file not found: {path}")
-    lines = Path(path).read_text().split("\n")
-    if growing:
-        lines = lines[:-1]  # text after the last newline: empty, or a line still being written
+        return []
+    lines = Path(path).read_text().split("\n")[:-1]  # after the last newline: empty, or still being written
     return [json.loads(line) for line in lines if line.strip()]
 
 
-def read_records(path):
-    """Read input records from .jsonl or .parquet (e.g. a SkyRL/verl dataset)."""
+def _parquet(path):
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        sys.exit("reading .parquet needs pyarrow (pip install pyarrow)")
+    return pq.ParquetFile(path)
+
+
+def iter_records(path):
+    """Yield input records one by one from .jsonl (blank lines skipped) or .parquet, without loading
+    the whole file, so inputs of many GB are fine."""
+    if not Path(path).is_file():
+        sys.exit(f"file not found: {path}")
     if str(path).endswith(".parquet"):
-        if not Path(path).is_file():
-            sys.exit(f"file not found: {path}")
-        try:
-            import pyarrow.parquet as pq
-        except ImportError:
-            sys.exit("reading .parquet needs pyarrow (pip install pyarrow)")
-        return pq.read_table(path).to_pylist()
-    return read_jsonl(path)
+        for batch in _parquet(path).iter_batches(batch_size=1000):
+            yield from batch.to_pylist()
+        return
+    with open(path, encoding="utf-8") as f:
+        for n, line in enumerate(f, 1):
+            if line.strip():
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError as e:
+                    sys.exit(f"{path}: line {n} is not valid JSON: {e}")
+
+
+def count_records(path):
+    """Number of records iter_records(path) yields (a quick pass over the file)."""
+    if not Path(path).is_file():
+        sys.exit(f"file not found: {path}")
+    if str(path).endswith(".parquet"):
+        return _parquet(path).metadata.num_rows
+    with open(path, "rb") as f:
+        return sum(1 for line in f if line.strip())
+
+
+def read_records(path):
+    """Read all input records from .jsonl or .parquet (e.g. a SkyRL/verl dataset)."""
+    return list(iter_records(path))
 
 
 def get_messages(record):
@@ -66,29 +92,47 @@ def get_messages(record):
 
 
 def add_server_args(parser):
-    parser.add_argument("--urls", default=os.environ.get("VLLM_URLS"),
-                        help="comma-separated OpenAI-compatible base URLs (default: $VLLM_URLS)")
+    parser.add_argument("--url", default=os.environ.get("VLLM_URL"),
+                        help="OpenAI-compatible base URL: one vLLM server, or a vllm-router in front of "
+                             "several (default: $VLLM_URL, set by the launcher)")
+    parser.add_argument("--servers", type=int, default=int(os.environ.get("VLLM_SERVERS") or 1),
+                        help="number of vLLM servers behind --url (default: $VLLM_SERVERS, set by the "
+                             "launcher, else 1)")
     parser.add_argument("--served-name", default=os.environ.get("SERVED_NAME"),
                         help="model name to put in API requests (default: $SERVED_NAME)")
     parser.add_argument("--concurrency", type=int, default=64,
-                        help="max in-flight requests per server")
+                        help="max in-flight requests per server (in total: concurrency x servers)")
     # Used by the cluster launchers: validate arguments and the resume state, then exit,
     # so mistakes show up before minutes of vLLM startup.
     parser.add_argument("--check-args", action="store_true", help=argparse.SUPPRESS)
 
 
-def make_clients(args):
-    from openai import AsyncOpenAI  # imported here so --help works without openai installed
+def make_client(args, connections):
+    # imported here so --help works without openai installed
+    from openai import AsyncOpenAI, DefaultAsyncHttpxClient
+    try:  # the HTTP library under openai: httpx2 in newer releases, httpx before
+        import httpx2 as httpx
+        if not issubclass(DefaultAsyncHttpxClient, httpx.AsyncClient):
+            raise ImportError
+    except ImportError:
+        import httpx
 
-    if not args.urls:
-        sys.exit("no vLLM endpoints: pass --urls or set VLLM_URLS")
+    if not args.url:
+        sys.exit("no vLLM URL: pass --url or set VLLM_URL")
+    if "," in args.url:
+        sys.exit("--url takes one URL. For several servers, start a vllm-router in front of them, e.g.\n"
+                 "  uvx --from vllm-router==0.1.16 vllm-router --policy round_robin --port 9000 "
+                 "--worker-urls http://host:8000 http://host:8001\n"
+                 "and pass --url http://<router host>:9000/v1 --servers 2")
     if not args.served_name:
         sys.exit("no model name: pass --served-name or set SERVED_NAME")
     # API_KEY_FILE: set by the launcher's --api-key-file (the servers then require the key)
     key_file = os.environ.get("API_KEY_FILE")
     api_key = Path(key_file).read_text().splitlines()[0].strip() if key_file else "EMPTY"
-    return [AsyncOpenAI(base_url=u.strip(), api_key=api_key, timeout=3600, max_retries=3)
-            for u in args.urls.split(",") if u.strip()]
+    # one kept-open connection per in-flight request (openai's default: at most 1000, 100 kept open)
+    http = DefaultAsyncHttpxClient(limits=httpx.Limits(max_connections=connections,
+                                                       max_keepalive_connections=connections))
+    return AsyncOpenAI(base_url=args.url, api_key=api_key, timeout=3600, max_retries=3, http_client=http)
 
 
 def _git(*cmd):
@@ -132,7 +176,7 @@ def start_meta(args, dry_run=False, record=None):
         "git_dirty": bool(status) if status is not None else None,
         "host": socket.gethostname(),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
-        "n_servers": len([u for u in (getattr(args, "urls", None) or "").split(",") if u.strip()]),
+        "n_servers": getattr(args, "servers", None),
     }
     meta["runs"].append(run)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -145,30 +189,37 @@ def finish_meta(path, meta, **result):
     path.write_text(json.dumps(meta, indent=2) + "\n")
 
 
-def run_resumable(items, worker, args, key, record=None, follow=None):
+def run_resumable(items, worker, args, key, record=None, follow=None, total=None):
     """Call `await worker(item, client) -> list[dict]` for every item and append the returned
-    records to `output` (JSONL) as soon as each item finishes.
+    records to `output` (JSONL) as soon as each item finishes (so in completion order).
 
+    `items`: a list, or any iterable (e.g. a generator streaming a big file; then pass `total`,
+    the number of items, for progress and ETA). --concurrency x --servers requests are in flight.
     Each item must have a unique `key` field. Items whose key already appears in `output`
     are skipped, so a job that timed out can simply be resubmitted with the same arguments.
     Items that fail are logged and skipped; rerun to retry them.
-    `args` needs .output and .concurrency; all of it (plus `record`) is recorded in <output>.meta.json.
+    `args` needs .output, .concurrency and .servers; all of it (plus `record`) is recorded in <output>.meta.json.
 
     follow=(load, producer_meta, timeout_min): the input is still being written by another job
     (e.g. judging while generating). See _follow.
     """
+    if total is None and hasattr(items, "__len__"):
+        total = len(items)
     if args.check_args:
         start_meta(args, dry_run=True, record=record)
-        print(f"arguments OK ({len(items)} items)")
+        print(f"arguments OK ({total if total is not None else '?'} items)")
         sys.exit(0)
-    clients = make_clients(args)
+    n_loops = args.concurrency * args.servers
+    client = make_client(args, n_loops)
+    output = Path(args.output)
+    done = _done_keys(output, key)  # before start_meta: a refusal here leaves no unfinished run behind
     meta_path, meta = start_meta(args, record=record)
     complete = True
     if follow:
         n_ok, n_fail, complete = asyncio.run(
-            _follow(*follow, worker, Path(args.output), key, clients, args.concurrency))
+            _follow(*follow, worker, output, key, client, n_loops, done))
     else:
-        n_ok, n_fail = asyncio.run(_run(items, worker, Path(args.output), key, clients, args.concurrency))
+        n_ok, n_fail = asyncio.run(_run(items, worker, output, key, client, n_loops, done, total))
     finish_meta(meta_path, meta, items_ok=n_ok, items_failed=n_fail, **({} if complete else {"incomplete": True}))
     if n_fail or not complete:
         sys.exit(1)
@@ -183,14 +234,14 @@ def _producer_finished(meta_path, since):
     return bool(runs) and (runs[-1].get("finished") or "") >= since
 
 
-async def _follow(load, producer_meta, timeout_min, worker, output, key, clients, concurrency):
+async def _follow(load, producer_meta, timeout_min, worker, output, key, client, n_loops, done):
     """Process items as another job appends them to the input: every FOLLOW_POLL_SECONDS, load()
     the input again and process the new items. Stop when the producer's run (producer_meta)
     finishes after we started and everything is processed, or when nothing new has appeared for
     timeout_min minutes (producer crashed or timed out; rerun to continue).
     Items that fail are not retried in this process; rerun to retry them."""
     since = _now()
-    attempted = {r[key] for r in read_jsonl(output)} if output.exists() else set()
+    attempted = set(done)
     n_ok = n_fail = 0
     last_new = time.time()
     print(f"following {producer_meta.removesuffix('.meta.json')} (new lines every {FOLLOW_POLL_SECONDS}s)", flush=True)
@@ -198,7 +249,7 @@ async def _follow(load, producer_meta, timeout_min, worker, output, key, clients
         finished = _producer_finished(producer_meta, since)  # check before loading: no line is missed
         new = [it for it in load() if it[key] not in attempted]
         if new:
-            ok, fail = await _run(new, worker, output, key, clients, concurrency)
+            ok, fail = await _run(new, worker, output, key, client, n_loops, set(), len(new))
             attempted.update(it[key] for it in new)
             n_ok, n_fail = n_ok + ok, n_fail + fail
             last_new = time.time()
@@ -212,38 +263,65 @@ async def _follow(load, producer_meta, timeout_min, worker, output, key, clients
         await asyncio.sleep(FOLLOW_POLL_SECONDS)
 
 
-async def _run(items, worker, output, key, clients, concurrency):
+def _done_keys(output, key):
+    """Keys of the items already in `output`. A last line cut off by a killed job is removed first
+    (its item is then redone)."""
     done = set()
-    if output.exists():
-        done = {r[key] for r in read_jsonl(output)}
-    todo = [it for it in items if it[key] not in done]
-    print(f"{len(items)} items, {len(done)} already in {output}, {len(todo)} to do, "
-          f"{len(clients)} server(s)", flush=True)
+    if not output.exists():
+        return done
+    good = 0  # bytes of complete lines
+    with open(output, "rb+") as f:
+        for n, line in enumerate(f, 1):
+            try:
+                rec = json.loads(line) if line.endswith(b"\n") else None
+            except ValueError:
+                rec = None
+            if rec is None:
+                if f.read(1):
+                    sys.exit(f"{output}: line {n} is broken and not the last line; fix or remove it by hand")
+                print(f"WARNING: {output}: removing the cut-off last line {n} (from a killed run)", flush=True)
+                f.truncate(good)
+                break
+            done.add(rec[key])
+            good += len(line)
+    return done
+
+
+async def _run(items, worker, output, key, client, n_loops, done, total=None):
+    """Process the items not in `done` with `n_loops` concurrent loops, each taking the next item from
+    the shared iterator, and append the results to `output`."""
+    print(f"{total if total is not None else '?'} items, {len(done)} already in {output}, "
+          f"{n_loops} requests at a time", flush=True)
     output.parent.mkdir(parents=True, exist_ok=True)
+    pending = iter(items)
+    n_ok = n_fail = n_skip = 0
+    start = last_report = time.time()
 
-    sems = [asyncio.Semaphore(concurrency) for _ in clients]
-    n_ok = n_fail = 0
-    start = time.time()
-
-    with open(output, "a") as out:
-        async def one(i, item):
-            nonlocal n_ok, n_fail
-            c = i % len(clients)
-            async with sems[c]:
+    with open(output, "a", encoding="utf-8") as out:
+        async def loop():
+            nonlocal n_ok, n_fail, n_skip, last_report
+            for item in pending:  # shared: every item is taken by exactly one loop
+                if item[key] in done:
+                    n_skip += 1
+                    continue
                 try:
-                    records = await worker(item, clients[c])
+                    records = await worker(item, client)
                 except Exception as e:
                     n_fail += 1
                     print(f"FAILED {key}={item[key]}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-                    return
-            for r in records:
-                out.write(json.dumps(r, ensure_ascii=False) + "\n")
-            out.flush()
-            n_ok += 1
-            if n_ok % 100 == 0:
-                print(f"{n_ok}/{len(todo)} done, {n_ok / (time.time() - start):.2f} items/s", flush=True)
+                    continue
+                for r in records:
+                    out.write(json.dumps(r, ensure_ascii=False) + "\n")
+                out.flush()
+                n_ok += 1
+                if time.time() - last_report >= PROGRESS_SECONDS:
+                    last_report = time.time()
+                    rate = (n_ok + n_fail) / (last_report - start)
+                    left = "" if total is None else (
+                        f", {total - n_ok - n_fail - n_skip} left, ETA {(total - n_ok - n_fail - n_skip) / 60 / rate:.0f} min")
+                    print(f"{n_ok} done, {n_fail} failed, {rate:.2f} items/s{left}", flush=True)
 
-        await asyncio.gather(*(one(i, it) for i, it in enumerate(todo)))
+        await asyncio.gather(*(loop() for _ in range(n_loops)))
 
-    print(f"finished: {n_ok} ok, {n_fail} failed, {time.time() - start:.0f}s", flush=True)
+    print(f"finished: {n_ok} ok, {n_fail} failed, {n_skip} already done, {time.time() - start:.0f}s", flush=True)
     return n_ok, n_fail

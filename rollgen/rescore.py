@@ -17,7 +17,7 @@ import json
 from pathlib import Path
 
 from _common import finish_meta, read_records, start_meta
-from _rubric import Judge
+from _rubric import Rubric
 
 
 def main():
@@ -27,7 +27,7 @@ def main():
     p.add_argument("--judge", required=True, help="judge folder whose rubric.toml has the new formula")
     args = p.parse_args()
 
-    judge = Judge(args.judge)
+    judge = Rubric(args.judge, need_reward=True)
     judge.check_reward()
     records = read_records(args.input)
     if Path(args.input).resolve() == Path(args.output).resolve():

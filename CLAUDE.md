@@ -17,8 +17,9 @@ See `docs/README.md` for the goal statement and priorities. **`README.md` is wri
 ## Decisions
 - **Inference**: self-hosted vLLM server (OpenAI-compatible API). Generation and judging both talk to it over HTTP.
 - **LLM-as-a-judge**: also a self-hosted vLLM server, not an external API, run as a **separate Slurm job**.
-- **Multi-node is the normal case.** One job = vLLM servers on every node (one srun step) + one client process
-  on the first node that load-balances over all servers. No Ray, no NCCL between nodes: servers are independent.
+- **Multi-node is the normal case.** One job = vLLM servers on every node (one srun step) + a vllm-router on the
+  first node in front of all of them + one client process there that talks only to the router (decided 2026-11-06:
+  balancing moved out of rollgen/). No Ray, no NCCL between nodes: servers are independent.
 - **Output target**: rollouts end up in **SkyRL** for training. The owner assumes a verl-style format; confirm the exact
   schema against SkyRL before finalizing the tokenizer/export script.
 
@@ -75,12 +76,17 @@ That script was the owner's working SkyRL training job on LUMI; the facts below 
 ## Repo structure
 ```
 rollgen/           # "native" to both clusters: the actual work (generate, judge, later filter/tokenize).
-  _common.py       #   JSONL I/O, vLLM clients from --urls/$VLLM_URLS, resumable async loop, meta.json, --check-args
+  _common.py       #   JSONL/parquet I/O (streamed), one vLLM client for --url/$VLLM_URL (a server or a router),
+                   #   resumable async loop (concurrency x --servers loops, cut-off last output line repaired),
+                   #   meta.json, --check-args
   generate.py      #   prompts .jsonl/.parquet -> n samples per prompt -> rollouts JSONL
                    #   (prompt: string | message list (SkyRL/verl) | "messages"); outputs stay JSONL (append/resume)
   judge.py         #   rollouts JSONL -> + judge_output, judge_scores, reward, judge_error (--judge judges/<name>)
+  classify.py      #   records .jsonl/.parquet -> sidecar labels JSONL (record_idx, --keep-fields, one field per
+                   #   criterion, classify_error) (--classifier classifiers/<name>); dedups identical requests
   rescore.py       #   recompute `reward` from stored judge_scores with an edited formula (no GPUs)
-  _rubric.py       #   loads judges/<name>/ (prompt.txt + rubric.toml), JSON schema, reward formula
+  _rubric.py       #   shared engine for judges + classifiers: loads a folder (prompt.txt|prompt.json, system.txt,
+                   #   rubric.toml), renders the prompt, JSON schema, parses replies, reward formula
 lumi/              # LUMI-specific glue: Slurm, container, starting vLLM
   _common.sh       #   site config, parse_launcher_args, record_run, start_vllm_servers, start_router,
                    #   run_in_container (host side); apply_env, node_addr (container side)
@@ -88,10 +94,12 @@ lumi/              # LUMI-specific glue: Slurm, container, starting vLLM
                    #   wait for health, write URLs to <run dir>/urls/<node>.txt, serve until killed
   generate.sbatch  #   policy model + rollgen/generate.py
   judge.sbatch     #   judge model + rollgen/judge.py (separate job, chain with --dependency=afterok)
+  classify.sbatch  #   classifier model + rollgen/classify.py
   serve.sbatch     #   servers + vllm-router (one URL), no client, held until walltime/scancel (Harbor on Tilde)
   _router.sh       #   inside container, first node: vllm-router (cache_aware) over all servers, self-test
                    #   (completion with key = 200, without = 401), write <run dir>/urls/router.txt
-  install_router.sh #  one-time, login node: pip --no-deps --target lumi/vllm-router/ (gitignored), pinned
+  install_router.sh #  one-time per clone, login node (every job needs it): pip --no-deps --target
+                   #   lumi/vllm-router/ (gitignored), pinned
 tilde/             # Tilde-specific glue (plain bash, no Slurm)
   install.sh       #   one-time: uv + `uv tool install harbor==<pin>` (Docker assumed present)
   download_dataset.sh #   Harbor registry dataset -> data/harbor/<name>@<version>/<task>/
@@ -100,6 +108,8 @@ tilde/             # Tilde-specific glue (plain bash, no Slurm)
                    #   close tunnel on exit -> logs/harbor/<job>/ (+ run.txt); --resume. Walkthrough: docs/harbor_tilde.md
 judges/            # one folder per judge: prompt.txt ({prompt}, {completion}, {answer}, {criteria}) +
                    #   rubric.toml (reward formula + criteria); user content, not code
+classifiers/       # one folder per classifier, same format without reward (difficulty/: from the owner's
+                   #   difficulty_classifiers.py, gitignored at the repo root)
 examples/          # tiny example inputs for smoke tests
 runs/              # per-experiment launch scripts (bash runs/<name>.sh)
 docs/              # all docs (index: docs/README.md). Top-level README.md is owner-written only
@@ -115,7 +125,7 @@ Sbatch files must be submitted from the repo root (they use `$SLURM_SUBMIT_DIR`)
 - **Flags only.** Every setting is a command-line flag; no env vars in normal use.
   `sbatch --nodes=4 lumi/generate.sbatch --model PATH --tp 2 --input ... --output ... --samples-per-prompt 8`
   The launcher consumes server flags (`--model`, `--served-name`, `--tp`, `--vllm-args`, `--no-stage-model`,
-  `--startup-timeout`, `--compile-cache`, `--api-key-file`) and passes everything else to the Python script
+  `--startup-timeout`, `--compile-cache`, `--api-key-file`, `--router-policy`) and passes everything else to the Python script
   (serve.sbatch has no script and rejects other flags). Slurm things (nodes, time, partition)
   stay regular sbatch options. Site config (SIF, BINDS, HF_HOME) is env-overridable but not part of the interface.
 - `bash lumi/<entry>.sbatch --help` works on a login node: launcher flags plus the Python script's --help.
@@ -129,7 +139,7 @@ Sbatch files must be submitted from the repo root (they use `$SLURM_SUBMIT_DIR`)
     writing to the moved file), `run.txt` (full command, nodes, model/TP, container, git commit/status/diff),
     `<node>-vllm-<i>.log`, `urls/` (only while the servers run; removed on exit so a dead job never looks alive).
     `logs/latest_run` is a symlink to the newest run folder.
-  - Resuming into an existing output with different settings is refused (only `urls`, `concurrency` may differ).
+  - Resuming into an existing output with different settings is refused (only `url`, `servers`, `concurrency` may differ).
 - Per-experiment run files live in `runs/<name>.sh`: plain bash holding the sbatch command(s), `cd` to the repo
   root first, run with `bash runs/<name>.sh`. No special support; what actually ran is in `logs/<run>/run.txt`.
   If colleagues want more, revisit "one run file per experiment" (variant B).
@@ -141,13 +151,31 @@ Sbatch files must be submitted from the repo root (they use `$SLURM_SUBMIT_DIR`)
 - `reward` is a one-line Python expression over criterion names, evaluated with no builtins except
   min/max/abs/round; names and attribute access are checked up front. Trusted-team tool, not a sandbox.
 - Reweighting is free: `rescore.py` recomputes rewards from stored `judge_scores`. Changed questions need a re-judge.
-- prompt.txt and rubric.toml contents are stored in meta.json settings, so resuming with an edited judge is refused.
+- prompt.txt|json, system.txt and rubric.toml contents are stored in meta.json settings, so resuming with an edited judge is refused.
 - TOML (stdlib `tomllib`) because nothing extra is needed in the container. Gotcha: `reward` must be above `[criteria]`.
 - Old `--template`/`--score-regex` interface removed (one way to judge).
 - `judge.py --follow`: judge job runs alongside generation (`--dependency=after:`), re-reads the growing rollouts
   file every 30s (ignores an unfinished last line; rollout_idx = line number, stable because generate only appends),
   stops when the newest run in `<input>.meta.json` finished after the judge started, or after `--follow-timeout`
   minutes without new lines (then exit 1, run marked `incomplete`). Failed items aren't retried within one run.
+
+## Classifiers (decided 2026-11-06)
+- Owner wants many classify/judge jobs, each just 2-3 config files. So one engine (`_rubric.py`) and one folder
+  format for both; `judge.py` and `classify.py` are thin (they differ in input, output shape, reward).
+- Folder: `prompt.txt` (text template) or `prompt.json` (user message as a JSON object, the owner's style in
+  difficulty_classifiers.py), optional `system.txt` (verbatim, no placeholders), `rubric.toml`.
+- Placeholders: `{a[b][0]}`, `{x?}` optional (left out if missing/empty), strings as-is, others as JSON. Missing
+  required field -> error line for that record; missing in record 0 -> stop before starting (typo check).
+- rubric.toml additions: `enum` type (values), `when = "field"` (ask only if present, else null), `reasoning =
+  false`, `max_field_chars` (head 2/3 + tail 1/3, marker as in the original). Classifiers must not have `reward`.
+- `classifiers/difficulty/` sends byte-identical requests (system, user JSON, schema) to difficulty_classifiers.py
+  (checked on synthetic records 2026-11-06). Differences: sidecar lines in completion order with `record_idx`
+  (original: input order), `classify_error` instead of `_classification_skipped/_error`, failed server requests
+  are retried on rerun (original: written as skipped after 5 tries), thinking off via `--extra-body`.
+- Client throughput: ~450 req/s per process, CPU-bound in the openai client (our code ~2%); enough for realistic
+  node counts. Memory stays flat on large inputs (672 MB input -> 133 MB RSS).
+- No tilde/ launcher yet (no one-step Tilde launchers exist); there: `uvx --from vllm-router==0.1.16 vllm-router`
+  in front of the servers, then classify.py --url <router> --servers N (docs/classifiers.md; tested locally).
 
 ## Current scope
 - Focus: **one-step RL rollouts + LLM judge, on LUMI first**. Tilde comes after.
@@ -215,9 +243,15 @@ Harbor layout (decided 2026-11-05; facts from harbor 0.20.0 source):
     job id/run name, Ctrl-C (tunnel up during Harbor's SIGINT handling, closed after). Never run for real.
 - tunnel.sh removed (2026-11-06); `logs/tunnel.urls`/`tunnel.run` are no longer read or written.
 
-vllm-router (decided 2026-11-06): multi-server balancing for Harbor happens on LUMI, not Tilde. serve.sbatch starts
-vllm-router 0.1.16 (`pip install vllm-router`, fork of SGLang's model gateway; Rust core) on the first node, port 9000,
-`--policy cache_aware` (prefix-tree routing: an agent trial's turns stay on one server; spreads load otherwise).
+vllm-router (decided 2026-11-06): multi-server balancing happens in vllm-router 0.1.16 (`pip install vllm-router`,
+fork of SGLang's model gateway; Rust core), started by start_router in **every** LUMI job on the first node, port 9000.
+For Harbor that means balancing on LUMI, not Tilde. Policy: launcher flag `--router-policy`, default round_robin
+(generate/judge/classify: independent one-step requests, predictable even spread), serve.sbatch sets
+DEFAULT_ROUTER_POLICY=cache_aware (prefix-tree routing: an agent trial's turns stay on one server).
+`--request-timeout-secs 3600` (= the openai client's timeout; router default 1800 could cut long generations).
+The client gets VLLM_URL (router) + VLLM_SERVERS (count) from start_router; `--concurrency` stays per server and
+rollgen keeps concurrency x servers requests in flight over one AsyncOpenAI client whose connection pool is sized
+to that (openai's default pool: 1000 connections, 100 kept alive; openai 3.46 uses httpx2, older httpx).
 Installed by lumi/install_router.sh into lumi/vllm-router/ with --no-deps (container has fastapi, uvicorn, aiohttp,
 requests, setproctitle; orjson installed alongside) and run in the container with PYTHONPATH.
 - Gotcha: vllm-router's `--api-key` is only the key it sends TO the workers; incoming requests are unchecked unless
@@ -226,11 +260,23 @@ requests, setproctitle; orjson installed alongside) and run in the container wit
   validating against the first worker's /v1/models. The self-test refuses to publish the URL if a keyless request
   isn't rejected. With validation on, every endpoint (also /health) needs the key.
 - Router `/v1/models` passes vLLM's response through (incl. max_model_len), which harbor_run.sh relies on.
+- Request bodies (checked 2026-11-06 with a body-logging fake server): every field arrives unchanged, unknown ones
+  too (response_format, chat_template_kwargs, n, top_k, min_p, ...). The router ADDS its typed-struct defaults:
+  continue_final_message/ignore_eos/logprobs/stream false, include_reasoning/skip_special_tokens true (= vLLM's
+  defaults) and SGLang-only no_stop_trim, separate_reasoning, stream_reasoning, return_hidden_states (vLLM should
+  ignore unknown fields, maybe with a warning per request: check vLLM logs on LUMI). Classify labels through the
+  router == without it. round_robin split 60 requests 30/30; cache_aware split 3000 classify requests 1424/1366.
+- Two routers on one host collide on the Prometheus port 29000 (router dies at startup). Can't happen on LUMI
+  (--exclusive nodes, one router per job); matters only for local tests.
 - Tested locally (2026-11-06) with two fake key-checking vLLM servers: auth 200/401 as expected; 8 concurrent
   distinct trials split 4/4 and each trial's next turn hit the same server. Sequential single requests all
   went to one server (load balancing kicks in under load). Not yet run on LUMI.
 - Single point: if worker 0 (key validation target) dies, all requests fail auth. The router itself dying ends
-  the job (serve.sbatch `wait -n`).
+  the job (serve.sbatch `wait -n`); in generate/judge/classify the client's requests then fail (rerun resumes).
+- Known: `run_in_container ... &` in start_router backgrounds a shell function, so ROUTER_PID is a subshell and
+  stop_vllm_servers' `kill` misses the router (seen in a local stub test 2026-11-06). Harmless on LUMI: the batch
+  script exits right after and Slurm kills all of the job's processes. Fix if it ever matters (e.g. `exec` the
+  singularity call in a subshell so $! is the container process).
 
 Remaining in tilde/: a tunnel dying mid-run is not restarted (trials then fail; resume after). Next: measure vLLM
 prefix-cache hit rate per server (`vllm:prefix_cache_*` in /metrics); later

@@ -13,7 +13,7 @@ set -a
 # --- per-job paths (on shared storage) ---
 : "${REPO:=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 : "${LOGS_DIR:=$REPO/logs}"
-: "${ROUTER_DIR:=$REPO/lumi/vllm-router}"   # vllm-router for serve.sbatch, from lumi/install_router.sh
+: "${ROUTER_DIR:=$REPO/lumi/vllm-router}"   # vllm-router (every job), from lumi/install_router.sh
 : "${ROUTER_PORT:=9000}"
 # One folder per job: slurm.out, run.txt, vLLM logs, server URLs. Set once in the batch script,
 # inherited by every node. Date first, so `ls logs/` is chronological.
@@ -37,6 +37,9 @@ LAUNCHER_HELP='Launcher flags (consumed here, everything else goes to the Python
                           start faster; default: node-local /tmp, recompiled every job
   --api-key-file FILE     servers require this key (file holds one line; chmod 600). Without it, anyone
                           on the LUMI network can use the servers while the job runs
+  --router-policy NAME    how vllm-router spreads requests over the servers: round_robin (default), or
+                          cache_aware (default of serve.sbatch: requests sharing a prompt prefix, like the
+                          turns of one agent trial, stay on one server), random, power_of_two, consistent_hash
 Node count, time limit, partition: regular sbatch options, e.g. `sbatch --nodes=4 --time=04:00:00 ...`.'
 
 # Local directory for --model: the dir itself, or the snapshot of a hub id in $HF_HOME/hub
@@ -59,6 +62,7 @@ resolve_model_dir() {
 parse_launcher_args() {
   local script=$1; shift
   MODEL="" SERVED_NAME="" TP=1 VLLM_ARGS="" STAGE_MODEL=1 STARTUP_TIMEOUT=1800 COMPILE_CACHE="" API_KEY_FILE=""
+  ROUTER_POLICY=${DEFAULT_ROUTER_POLICY:-round_robin}   # serve.sbatch sets DEFAULT_ROUTER_POLICY
   CLIENT_ARGS=()
   local want_help=0
   while (( $# )); do
@@ -78,6 +82,8 @@ parse_launcher_args() {
       --compile-cache=*)    COMPILE_CACHE=${1#*=}; shift ;;
       --api-key-file)       API_KEY_FILE=$2; shift 2 ;;
       --api-key-file=*)     API_KEY_FILE=${1#*=}; shift ;;
+      --router-policy)      ROUTER_POLICY=$2; shift 2 ;;
+      --router-policy=*)    ROUTER_POLICY=${1#*=}; shift ;;
       -h|--help)            want_help=1; shift ;;
       *)                    CLIENT_ARGS+=("$1"); shift ;;
     esac
@@ -92,6 +98,11 @@ parse_launcher_args() {
   fi
   [ -n "$script" ] || (( ${#CLIENT_ARGS[@]} == 0 )) || die "unknown flag(s): ${CLIENT_ARGS[*]} (see --help)"
   [ -n "$MODEL" ] || die "--model is required (see --help)"
+  [ -d "$ROUTER_DIR/vllm_router" ] || die "vllm-router not installed: run 'bash lumi/install_router.sh' once on a login node"
+  case "$ROUTER_POLICY" in
+    round_robin|cache_aware|random|power_of_two|consistent_hash) ;;
+    *) die "--router-policy $ROUTER_POLICY: expected round_robin, cache_aware, random, power_of_two or consistent_hash" ;;
+  esac
   [[ "$TP" =~ ^[0-9]+$ ]] && (( GPUS_PER_NODE % TP == 0 )) || die "--tp $TP must divide GPUS_PER_NODE=$GPUS_PER_NODE"
   MODEL_DIR=$(resolve_model_dir "$MODEL")
   [ -n "$MODEL_DIR" ] && [ -f "$MODEL_DIR/config.json" ] \
@@ -108,7 +119,7 @@ parse_launcher_args() {
     API_KEY_FILE=$(cd "$(dirname "$API_KEY_FILE")" && pwd)/$(basename "$API_KEY_FILE")
     [[ "$(stat -c %a "$API_KEY_FILE")" == *00 ]] || die "--api-key-file is readable by others: chmod 600 $API_KEY_FILE"
   fi
-  export MODEL MODEL_DIR SERVED_NAME TP VLLM_ARGS STAGE_MODEL STARTUP_TIMEOUT COMPILE_CACHE API_KEY_FILE
+  export MODEL MODEL_DIR SERVED_NAME TP VLLM_ARGS STAGE_MODEL STARTUP_TIMEOUT COMPILE_CACHE API_KEY_FILE ROUTER_POLICY
 
   # Validate the Python script's arguments (typos, missing input, changed settings on resume)
   # now, instead of after minutes of vLLM startup.
@@ -153,7 +164,7 @@ record_run() {
 }
 
 # Start vLLM on every node of the allocation (one srun task per node, in the background),
-# wait until all of them are healthy, then export VLLM_URLS (comma-separated) for the client.
+# wait until all of them are healthy, then export SERVER_URLS (comma-separated) for the router.
 # The servers are stopped when the batch script exits.
 start_vllm_servers() {
   local nodes=$SLURM_JOB_NUM_NODES
@@ -178,13 +189,14 @@ start_vllm_servers() {
     (( SECONDS < STARTUP_TIMEOUT )) || die "vLLM not ready on all nodes after ${STARTUP_TIMEOUT}s, see $RUN_DIR"
     sleep 10
   done
-  VLLM_URLS=$(cat "$RUN_DIR"/urls/*.txt | paste -sd,)
-  export VLLM_URLS
-  echo "all vLLM servers healthy after ${SECONDS}s: $VLLM_URLS"
+  SERVER_URLS=$(cat "$RUN_DIR"/urls/*.txt | paste -sd,)
+  export SERVER_URLS
+  echo "all vLLM servers healthy after ${SECONDS}s: $SERVER_URLS"
 }
 
-# Start vllm-router (lumi/_router.sh) on this (the first) node in front of all servers in VLLM_URLS,
-# wait until it works, then export ROUTER_URL. Call after start_vllm_servers; stopped with the servers.
+# Start vllm-router (lumi/_router.sh) on this (the first) node in front of all servers in SERVER_URLS,
+# wait until it works, then export VLLM_URL (its URL) and VLLM_SERVERS (how many servers are behind
+# it) for the client. Call after start_vllm_servers; stopped with the servers.
 start_router() {
   run_in_container bash "$REPO/lumi/_router.sh" &
   ROUTER_PID=$!
@@ -192,8 +204,9 @@ start_router() {
     kill -0 "$ROUTER_PID" 2>/dev/null || die "vllm-router failed to start, see above and $RUN_DIR/router.log"
     sleep 5
   done
-  ROUTER_URL=$(< "$RUN_DIR/urls/router.txt")
-  export ROUTER_URL
+  VLLM_URL=$(< "$RUN_DIR/urls/router.txt")
+  VLLM_SERVERS=$(tr ',' '\n' <<< "$SERVER_URLS" | grep -c .)
+  export VLLM_URL VLLM_SERVERS
 }
 
 stop_vllm_servers() {
