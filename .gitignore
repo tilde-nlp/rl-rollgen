@@ -4,4 +4,5 @@ logs/*
 !logs/.gitkeep
 *.out
 data/
-EXAMPLES.md
+lumi/vllm-router/
+lumi/.vllm-router-*/

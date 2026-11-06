@@ -6,6 +6,7 @@
 #   4. keeps serving until killed (when the client is done, or at the end of a serve.sbatch job)
 # Server config (MODEL_DIR, SERVED_NAME, TP, VLLM_ARGS, STAGE_MODEL, API_KEY_FILE) comes from the environment,
 # set by parse_launcher_args in lumi/_common.sh from the sbatch flags.
+# Arguments: none (not run by hand). The flags behind that environment are documented in lumi/generate.sbatch.
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
@@ -13,12 +14,7 @@ apply_env
 : "${MODEL_DIR:?MODEL_DIR not set (this script is started by lumi/*.sbatch, not by hand)}"
 
 NODE="${SLURMD_NODENAME:-$(hostname)}"
-# Address other nodes use to reach this one: the Slingshot interface if present.
-# (The container has no `ip` command; ask the kernel directly: SIOCGIFADDR = 0x8915.)
-: "${NODE_ADDR:=$(python -c 'import fcntl, socket, struct
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-print(socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", b"hsn0"))[20:24]))' 2>/dev/null)}"
-: "${NODE_ADDR:=$NODE}"
+NODE_ADDR=$(node_addr)   # hsn0 (Slingshot) IP, reachable from other nodes and the login nodes
 mkdir -p "$RUN_DIR"
 # vLLM reads VLLM_API_KEY itself; passing it this way keeps the key out of `ps` output and logs.
 if [ -n "${API_KEY_FILE:-}" ]; then VLLM_API_KEY=$(head -1 "$API_KEY_FILE"); export VLLM_API_KEY; fi

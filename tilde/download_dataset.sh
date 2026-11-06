@@ -4,6 +4,10 @@
 #
 #   tilde/download_dataset.sh terminal-bench@2.0
 #   harbor datasets list --legacy          # what exists
+#
+# Arguments:
+#   <name>@<version>   (required, the only argument) registry dataset with a pinned version,
+#                      e.g. terminal-bench@2.0. Refuses to overwrite an existing download.
 set -euo pipefail
 die() { echo "FATAL: $*" >&2; exit 1; }
 [[ "${1:-}" == ?*@?* ]] || die "usage: tilde/download_dataset.sh <name>@<version> (pin the version)"

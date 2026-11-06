@@ -22,6 +22,49 @@
 #   jid=$(sbatch --parsable lumi/generate.sbatch ...)
 #   sbatch --dependency=afterok:$jid lumi/judge.sbatch ...
 #
+# Arguments. Slurm options go before the script name, all other flags after it.
+#   sbatch options (common ones):
+#     --nodes=N                 vLLM servers start on every node (8 / --tp servers per node)
+#     --time=HH:MM:SS           time limit; a timed-out generate/judge job can be resubmitted (it resumes)
+#     -p, --partition=NAME      dev-g (testing, ONE job per project), small-g, standard-g
+#     --dependency=after:JOBID  start once JOBID has started (afterok:JOBID = once it finished OK)
+#     --job-name=NAME           shows up in squeue and in the logs/ folder name
+#   Server flags (read by the launcher in lumi/_common.sh, not passed to Python):
+#     --model PATH|HUB_ID       (required) model dir, or HF hub id already downloaded to $HF_HOME,
+#                               e.g. Qwen/Qwen3-32B (compute nodes are offline)
+#     --served-name NAME        model name used in API requests (default: basename of --model)
+#     --tp N                    tensor parallel size per vLLM server, must divide 8 (default: 1)
+#     --vllm-args "ARGS"        extra `vllm serve` flags as ONE quoted string. The most useful ones:
+#                                 --max-model-len N           context length (prompt + output); smaller
+#                                                             leaves more memory for KV cache
+#                                 --gpu-memory-utilization F  share of GPU memory vLLM takes (vLLM default 0.9)
+#                                 --max-num-seqs N            max sequences one server runs at once
+#                                 --enforce-eager             no torch.compile / graphs: faster startup,
+#                                                             slower generation (good for quick tests)
+#                                 --dtype bfloat16            weight / activation dtype
+#                                 --seed N                    sampling seed
+#                                 full list: `vllm serve --help` in the container
+#     --no-stage-model          load weights from Lustre instead of copying them to node-local /tmp first
+#     --startup-timeout SEC     max wait for all servers to answer /health (default: 1800)
+#     --compile-cache DIR       keep compile caches in DIR (on /scratch, never $HOME) so later jobs start
+#                               faster (default: node-local /tmp, recompiled every job)
+#     --api-key-file FILE       servers require the key in FILE (one line, chmod 600); without it anyone on
+#                               the LUMI network can use them while the job runs
+#   rollgen/judge.py flags (passed through):
+#     --input FILE              (required) rollouts .jsonl/.parquet from generate (still growing with --follow)
+#     --output FILE             (required) judged .jsonl; an existing file is resumed, same settings only
+#                               (--concurrency may differ; an edited judge counts as different)
+#     --judge DIR               (required) judge folder with prompt.txt + rubric.toml, e.g. judges/correctness
+#     --temperature F           (default: 0.0)
+#     --max-tokens N            max tokens of the judge's reply (default: 2048)
+#     --extra-body JSON         extra sampling params for vLLM; for Qwen3 judges:
+#                               '{"chat_template_kwargs": {"enable_thinking": false}}'
+#     --follow                  judge while generation is still writing --input (start with
+#                               --dependency=after:JOBID); stops when that generation run finishes
+#     --follow-timeout MIN      with --follow: give up after MIN minutes without new rollouts (default: 60)
+#     --concurrency N           max in-flight requests per server (default: 64)
+#     (--urls is filled in by the launcher: all servers of this job)
+#
 # All flags:  bash lumi/judge.sbatch --help     (works on a login node)
 # Logs:       logs/latest_run/ (slurm.out, run.txt, vLLM logs); run record also in <output>.meta.json
 set -euo pipefail

@@ -1,5 +1,7 @@
 # Shared LUMI code, sourced by lumi/*.sbatch (on the host) and lumi/_vllm_node.sh (inside the container).
 # Users don't need to read this; the entry points are lumi/*.sbatch.
+# Arguments: none (sourced). The site config below can be overridden by exporting the variables before sbatch.
+# The flags parsed here (parse_launcher_args) are documented at the top of lumi/generate.sbatch.
 
 # --- site config (rarely changes; override by exporting before sbatch if you must) ---
 set -a
@@ -11,6 +13,8 @@ set -a
 # --- per-job paths (on shared storage) ---
 : "${REPO:=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 : "${LOGS_DIR:=$REPO/logs}"
+: "${ROUTER_DIR:=$REPO/lumi/vllm-router}"   # vllm-router for serve.sbatch, from lumi/install_router.sh
+: "${ROUTER_PORT:=9000}"
 # One folder per job: slurm.out, run.txt, vLLM logs, server URLs. Set once in the batch script,
 # inherited by every node. Date first, so `ls logs/` is chronological.
 : "${RUN_DIR:=$LOGS_DIR/$(date +%Y%m%d-%H%M%S)-${SLURM_JOB_NAME:-local}-${SLURM_JOB_ID:-$$}}"
@@ -179,9 +183,23 @@ start_vllm_servers() {
   echo "all vLLM servers healthy after ${SECONDS}s: $VLLM_URLS"
 }
 
+# Start vllm-router (lumi/_router.sh) on this (the first) node in front of all servers in VLLM_URLS,
+# wait until it works, then export ROUTER_URL. Call after start_vllm_servers; stopped with the servers.
+start_router() {
+  run_in_container bash "$REPO/lumi/_router.sh" &
+  ROUTER_PID=$!
+  until [ -f "$RUN_DIR/urls/router.txt" ]; do
+    kill -0 "$ROUTER_PID" 2>/dev/null || die "vllm-router failed to start, see above and $RUN_DIR/router.log"
+    sleep 5
+  done
+  ROUTER_URL=$(< "$RUN_DIR/urls/router.txt")
+  export ROUTER_URL
+}
+
 stop_vllm_servers() {
   local rc=$?
   rm -rf "$RUN_DIR/urls"   # only valid while the servers run; a leftover would look like a live job
+  if [ -n "${ROUTER_PID:-}" ]; then kill "$ROUTER_PID" 2>/dev/null || true; fi
   if [ -n "${SERVERS_PID:-}" ] && kill -0 "$SERVERS_PID" 2>/dev/null; then
     echo "stopping vLLM servers"
     kill "$SERVERS_PID" 2>/dev/null || true
@@ -196,8 +214,18 @@ run_in_container() {
 }
 
 # ---------------------------------------------------------------------------
-# Container side (called from lumi/_vllm_node.sh)
+# Container side (called from lumi/_vllm_node.sh and lumi/_router.sh)
 # ---------------------------------------------------------------------------
+
+# Address other nodes use to reach this one: the Slingshot interface (hsn0) if present, else the hostname.
+# (The container has no `ip` command; ask the kernel directly: SIOCGIFADDR = 0x8915.)
+node_addr() {
+  python -c 'import fcntl, socket, struct
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+print(socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", b"hsn0"))[20:24]))' 2>/dev/null \
+    || echo "${SLURMD_NODENAME:-$(hostname)}"
+}
+
 apply_env() {
   export PYTHONNOUSERSITE=1
   export HF_HUB_OFFLINE=1                    # compute nodes have no internet: pre-download models
