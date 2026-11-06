@@ -17,7 +17,7 @@
 # Once per clone, on a login node:  bash lumi/install_router.sh
 #
 # Submit from the repo root:
-#   sbatch --nodes=4 lumi/generate.sbatch --model /scratch/.../my-model --tp 2 \
+#   sbatch --nodes=4 lumi/generate.sbatch --model Qwen/Qwen3-32B --tp 4 \
 #       --input data/prompts.jsonl --output data/rollouts.jsonl --samples-per-prompt 8 --max-tokens 2048
 #
 # Arguments. Slurm options go before the script name, all other flags after it.

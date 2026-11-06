@@ -5,7 +5,7 @@ It is a folder `configs/classifiers/<name>/` with a `config.py` (same format as 
 Copy one to make a new classifier; use it as `--classifier <name>` (or pass a folder path).
 
 ```bash
-sbatch --nodes=2 lumi/classify.sbatch --model /scratch/.../gemma-4-12B-it \
+sbatch --nodes=2 lumi/classify.sbatch --model Qwen/Qwen3-32B --tp 4 \
     --input data/so_openq.jsonl --output data/so_openq.difficulty.jsonl \
     --classifier difficulty --keep-fields uuid \
     --extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'
@@ -65,6 +65,14 @@ so on LUMI run it in the container, elsewhere `uv run --with openai python ...`)
 ```bash
 python rollgen/classify.py --check-args --classifier is_math --input data/x.jsonl --output data/x.is_math.jsonl
 ```
+Run it on LUMI: `--classifier` takes the folder name in `configs/classifiers/`, or a path to any folder with a
+`config.py` (relative to the repo root, where you submit from). The launcher passes it to `classify.py`:
+```bash
+sbatch --nodes=1 lumi/classify.sbatch --model Qwen/Qwen3-32B --tp 4 \
+    --input data/x.jsonl --output data/x.is_math.jsonl --classifier is_math --keep-fields uuid
+# or a folder elsewhere:  --classifier /scratch/project_465003062/my_configs/is_math
+```
+At job start, before vLLM loads, the job runs this check on record 0 and stops on a mistake (see `slurm.out`).
 
 `Output` is a [pydantic](https://docs.pydantic.dev/) model. It becomes the JSON schema that vLLM enforces
 (structured outputs), and the reply is checked against it. Types:

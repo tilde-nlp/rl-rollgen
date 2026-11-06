@@ -17,8 +17,9 @@
 # Once per clone, on a login node:  bash lumi/install_router.sh
 #
 # Submit from the repo root:
-#   sbatch --nodes=2 lumi/judge.sbatch --model /scratch/.../judge-model --tp 4 \
-#       --input data/rollouts.jsonl --output data/judged.jsonl --judge correctness
+#   sbatch --nodes=2 lumi/judge.sbatch --model Qwen/Qwen3-32B --tp 4 \
+#       --input data/rollouts.jsonl --output data/judged.jsonl --judge correctness \
+#       --extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'
 #
 # Chain after a generation job:
 #   jid=$(sbatch --parsable lumi/generate.sbatch ...)

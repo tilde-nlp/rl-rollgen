@@ -6,17 +6,18 @@ git clone <repo> && cd rl-rollgen      # always submit from the repo root
 bash lumi/install_router.sh            # once per clone, on a login node: vllm-router (see below)
 
 # 1. generate: 8 samples per prompt, vLLM on 4 nodes, TP=2
-sbatch --nodes=4 lumi/generate.sbatch --model /scratch/.../policy-model --tp 2 \
+sbatch --nodes=4 lumi/generate.sbatch --model Qwen/Qwen3-32B --tp 4 \
     --input data/prompts.jsonl --output data/rollouts.jsonl --samples-per-prompt 8 --max-tokens 2048
 
 # 2. judge
-sbatch --nodes=2 lumi/judge.sbatch --model /scratch/.../judge-model --tp 4 \
-    --input data/rollouts.jsonl --output data/judged.jsonl --judge correctness
+sbatch --nodes=2 lumi/judge.sbatch --model Qwen/Qwen3-32B --tp 4 \
+    --input data/rollouts.jsonl --output data/judged.jsonl --judge correctness \
+    --extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'
 ```
 
 Label a dataset (e.g. difficulty of each prompt; see [classifiers.md](classifiers.md)):
 ```bash
-sbatch --nodes=2 lumi/classify.sbatch --model /scratch/.../gemma-4-12B-it \
+sbatch --nodes=2 lumi/classify.sbatch --model Qwen/Qwen3-32B --tp 4 \
     --input data/so_openq.jsonl --output data/so_openq.difficulty.jsonl \
     --classifier difficulty --keep-fields uuid \
     --extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'

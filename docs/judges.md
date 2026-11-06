@@ -50,10 +50,11 @@ With `--follow`, the judge job runs at the same time as the generation job and g
 written, instead of waiting for the whole file.
 
 ```bash
-jid=$(sbatch --parsable --nodes=4 --time=04:00:00 lumi/generate.sbatch --model ... \
+jid=$(sbatch --parsable --nodes=4 --time=04:00:00 lumi/generate.sbatch --model Qwen/Qwen3-32B --tp 4 \
     --input data/prompts.jsonl --output data/rollouts.jsonl)
-sbatch --dependency=after:$jid --nodes=2 --time=04:00:00 lumi/judge.sbatch --model ... \
-    --input data/rollouts.jsonl --output data/judged.jsonl --judge correctness --follow
+sbatch --dependency=after:$jid --nodes=2 --time=04:00:00 lumi/judge.sbatch --model Qwen/Qwen3-32B --tp 4 \
+    --input data/rollouts.jsonl --output data/judged.jsonl --judge correctness --follow \
+    --extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'
 ```
 
 - `--dependency=after:$jid` starts the judge once generation has *started* (`afterok` would wait for it to *finish*).

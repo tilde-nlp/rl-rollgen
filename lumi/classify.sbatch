@@ -18,7 +18,7 @@
 # Once per clone, on a login node:  bash lumi/install_router.sh
 #
 # Submit from the repo root:
-#   sbatch --nodes=2 lumi/classify.sbatch --model /scratch/.../gemma-4-12B-it \
+#   sbatch --nodes=2 lumi/classify.sbatch --model Qwen/Qwen3-32B --tp 4 \
 #       --input data/so_openq.jsonl --output data/so_openq.difficulty.jsonl \
 #       --classifier difficulty --keep-fields uuid \
 #       --extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'
