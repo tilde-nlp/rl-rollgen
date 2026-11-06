@@ -27,6 +27,7 @@ bash lumi/install_router.sh                 # -> lumi/vllm-router/
 
 # 3. an API key for the vLLM servers. Without it, anyone on the LUMI network could use them, and on
 #    Tilde anyone on the machine could use the tunnel (127.0.0.1 is shared by all users there).
+#    serve.sbatch reads it on LUMI, harbor_run.sh on Tilde: you copy it to Tilde in step 0b.6.
 (umask 077; openssl rand -hex 24 > ~/.vllm_key)
 
 # 4. the model, if it isn't in the shared HF cache yet (compute nodes have no internet)
@@ -65,6 +66,10 @@ Host lumi-uan01.csc.fi
     IdentityFile ~/.ssh/id_lumi
 ```
 
+If you already have a `Host` alias for LUMI (e.g. `Host lumi` with `HostName lumi.csc.fi`), you don't need this
+block. Pass `--lumi-host lumi` to `harbor_run.sh` instead, and use `lumi` for `lumi-uan01.csc.fi` in the commands
+below. `ControlMaster` in your config is fine: the tunnel opens its own connection anyway.
+
 **5. Log in once by hand.** Answer `yes` to the host key question and type the passphrase. `harbor_run.sh`
 can't answer either of them.
 
@@ -72,11 +77,16 @@ can't answer either of them.
 ssh lumi-uan01.csc.fi hostname              # -> uan01
 ```
 
-**6. Copy the API key** from LUMI:
+**6. Copy the API key from LUMI to Tilde.** This is the key you created in step 0a.3. Both sides need the same
+key: the servers on LUMI check it, and `harbor_run.sh` on Tilde sends it (it reads `~/.vllm_key` by default).
 
 ```bash
 scp lumi-uan01.csc.fi:.vllm_key ~/.vllm_key && chmod 600 ~/.vllm_key
+diff <(ssh lumi-uan01.csc.fi cat .vllm_key) ~/.vllm_key && echo "same key on both sides"
 ```
+
+If you ever make a new key on LUMI, copy it again. With different keys, `harbor_run.sh` stops with
+"`.../models` failed (... wrong API key?)".
 
 ## 0c. Every time you log in to Tilde
 

@@ -153,7 +153,10 @@ EOF
 
   # setsid: Ctrl-C goes to Harbor only, so the tunnel stays up while Harbor cancels trials.
   # ServerAlive*: notice a dead link. ExitOnForwardFailure: fail if the local port is taken.
-  setsid "${SSH[@]}" -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  # ControlPath=none: own connection, even with ControlMaster in ~/.ssh/config. Through a shared master the
+  # forward would belong to the master and outlive this ssh (ControlPersist), keeping the port taken.
+  setsid "${SSH[@]}" -N -o ControlPath=none -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
     -L "127.0.0.1:$LOCAL_PORT:$HOSTPORT" "$LUMI_HOST" &
   TUNNEL_PID=$!
   trap 'kill "$TUNNEL_PID" 2>/dev/null || true' EXIT

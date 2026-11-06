@@ -30,7 +30,12 @@ TODO
 ## Multi-step RL
 
 ### Tilde sandboxes (docker) & LUMI vLLM
-lorem ipsum
+
+```
+0. use docs/harbor_tilde.md to set it up
+1. lumi/serve.sbatch on LUMI
+2. tilde/harbor_run.sh on Tilde
+```
 
 
 ### LUMI sandboxes (apptainer) & LUMI vLLM

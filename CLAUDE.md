@@ -199,7 +199,10 @@ Harbor layout (decided 2026-11-05; facts from harbor 0.20.0 source):
   `--resume NAME`; rest goes to `harbor run` / `harbor jobs resume`. Requires `harbor` on PATH (install.sh: 0.20.0).
   - Lookup: one ssh per 30s poll running a heredoc script on the login node: prints run folder, router URL,
     `squeue -j` state (GONE = not in queue -> die if no router). latest_run = newest *started* job of any kind.
-  - Tunnel: `setsid ssh -N -L 127.0.0.1:PORT:<router>` in the background (setsid: Ctrl-C reaches Harbor only, tunnel
+  - Tunnel: `setsid ssh -N -o ControlPath=none -L 127.0.0.1:PORT:<router>` in the background (ControlPath=none:
+    the owner's ~/.ssh/config has `Host lumi` (lumi.csc.fi) with ControlMaster auto + ControlPersist 10m; through
+    a shared master the forward would outlive our ssh and keep the port taken. Lookups may share the master.
+    `--lumi-host lumi` works with that alias; any login node reaches compute nodes, round-robin is fine) (setsid: Ctrl-C reaches Harbor only, tunnel
     stays up while Harbor cancels trials), ExitOnForwardFailure + ServerAlive; EXIT trap kills it. Harbor runs in
     the foreground (no exec) so the trap fires; the script exits with Harbor's code.
   - --resume: model + api_base from `config.json` (`agents[0].model_name`, `.kwargs.api_base`); a 127.0.0.1:PORT
