@@ -1,53 +1,48 @@
 # Judges
 
-A judge is a folder `judges/<name>/` with two or three files; copy one to make a new judge.
-- `prompt.txt`: the judge prompt. `{field}` placeholders are filled from each rollout (`{prompt}`, `{completion}`,
-  `{answer}`, `{reward_spec[ground_truth]}`, ...); `{criteria}` becomes the list of questions. Literal braces: `{{ }}`.
-- `rubric.toml`: the questions and the reward formula:
-  ```toml
-  reward = "0 if not correct else max(0, 10 - 5*bad_reasoning - (5 - clarity))"   # before [criteria]
+A judge is a folder `configs/judges/<name>/` with a `config.py`; copy one to make a new judge. Use it as
+`--judge <name>` (or pass a folder path). Start from `configs/judges/example/config.py`: a working judge where
+every part is explained. Same format as a [classifier](classifiers.md#writing-a-classifier):
 
-  [criteria]
-  correct       = { type = "bool", question = "Is the final answer correct?" }
-  bad_reasoning = { type = "bool", question = "Is the reasoning wrong even if the answer is right?" }
-  clarity       = { type = "int", min = 1, max = 5, question = "How clear is the explanation?" }
-  ```
-  The judge answers every question in JSON (enforced by vLLM structured outputs); the reward is computed from those
-  answers. `reward` is a Python expression over the criterion names (bools are 1/0; `min`, `max`, `abs`, `round`).
-- `system.txt` (optional): a system message.
+```python
+# configs/judges/correctness/config.py
+from pydantic import BaseModel
+from _ask import last_user_message
 
-Changing only `reward` → `rollgen/rescore.py`. Changing questions → rerun the judge.
 
-## Folder format
+class Output(BaseModel):     # stored per rollout as judge_scores
+    reasoning: str           # first, so the judge reasons before it answers
+    correct: bool
 
-Judges and [classifiers](classifiers.md) use the same folder format (`rollgen/_rubric.py`); only a judge has `reward`.
 
-| file | |
-|---|---|
-| `prompt.txt` | user message template, see placeholders below |
-| `prompt.json` | instead of `prompt.txt`: the user message as a JSON object, e.g. `{"problem": "{problem}", "tools": "{tools?}"}`. A value that is exactly one placeholder becomes the record's value (any JSON type); other values stay as written. Sent as compact JSON |
-| `system.txt` | optional system message, sent as-is (no placeholders, braces need no escaping) |
-| `rubric.toml` | settings (above `[criteria]`, a TOML rule) and the questions |
+def messages(r):             # one rollout from generate.py -> the request
+    return f"""You are grading a model's answer to a problem.
 
-Placeholders: `{name}`, nested `{reward_spec[ground_truth]}`, list items `{messages[0][content]}`.
-Strings are inserted as they are, other values as JSON. A field missing from a record makes that record an error
-line (`judge_error` / `classify_error`); a missing field in the *first* record stops the job before it starts
-(typo check). `{name?}` is optional: nothing (or no key, in `prompt.json`) if the field is missing or empty.
-`{prompt}`: for chat-message prompts, the last user message. `{criteria}`: the questions, required unless
-`system.txt` exists.
+Problem:
+{last_user_message(r)}
 
-`rubric.toml` settings:
-- `reward = "..."`: judges only (required there).
-- `reasoning = true` (default): the model writes a free-text `reasoning` field before its answers. `false`: answers only.
-- `max_field_chars = N`: strings inserted into the prompt longer than N characters are cut (2/3 head, 1/3 tail kept,
-  `[... truncated ...]` between).
+Reference answer:
+{r["answer"]}
 
-Criteria (`[criteria]`, answered in this order):
-- `{ type = "bool", question = "..." }`
-- `{ type = "int", min = 1, max = 5, question = "..." }`
-- `{ type = "enum", values = ["a", "b"], question = "..." }`
-- any of them with `when = "field"` (e.g. `"responses_create_params[tools]"`): asked only if the record has that
-  field (non-empty), otherwise `null`. In a `reward` formula it is then `None`.
+Model's response:
+{r["completion"]}
+
+Answer as a JSON object:
+- "reasoning": a brief explanation
+- "correct" (true/false): Is the model's final answer equivalent to the reference answer?"""
+```
+
+- `Output`: what the judge answers (types: see [classifiers.md](classifiers.md#writing-a-classifier), e.g.
+  `clarity: int = Field(ge=1, le=5)`). vLLM enforces it as a JSON schema. The answers are stored per rollout as
+  `judge_scores`, e.g. `{"reasoning": "...", "correct": true}`, the raw reply as `judge_output`. No reward is
+  computed; turning answers into a training reward is left to the training side.
+- `messages(r)`: the rollout has the input task's fields (`prompt`, `answer`, ...) plus `completion` (see
+  [data.md](data.md)). `last_user_message(r)` is the prompt as text (the last user message if the prompt is
+  chat messages). Return `None` to skip a rollout (it gets no output line). If it raises, that rollout gets a
+  `judge_error`; on the first rollout the job stops before it starts.
+
+Judges: `correctness` (final answer vs `answer`), `gsm8k` (also uses `reference_solution`; reasoning, answer
+line, clarity 1-5), `tool_use` (tool-call rollouts).
 
 ## Judging while generating
 
@@ -58,7 +53,7 @@ written, instead of waiting for the whole file.
 jid=$(sbatch --parsable --nodes=4 --time=04:00:00 lumi/generate.sbatch --model ... \
     --input data/prompts.jsonl --output data/rollouts.jsonl)
 sbatch --dependency=after:$jid --nodes=2 --time=04:00:00 lumi/judge.sbatch --model ... \
-    --input data/rollouts.jsonl --output data/judged.jsonl --judge judges/correctness --follow
+    --input data/rollouts.jsonl --output data/judged.jsonl --judge correctness --follow
 ```
 
 - `--dependency=after:$jid` starts the judge once generation has *started* (`afterok` would wait for it to *finish*).

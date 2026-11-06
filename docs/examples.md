@@ -7,7 +7,7 @@ Commands actually used to launch runs on LUMI. Submit from the repo root.
 ```bash
 sbatch --nodes=2 lumi/generate.sbatch \
     --model /scratch/project_465003062/environment/containers/grpo-pregen-rl/tildeopen --tp 4 \
-    --input examples/prompts.jsonl --output examples/rollouts.jsonl \
+    --input configs/examples/prompts.jsonl --output configs/examples/rollouts.jsonl \
     --samples-per-prompt 8 --max-tokens 2048
 ```
 
@@ -16,24 +16,24 @@ sbatch --nodes=2 lumi/generate.sbatch \
 ```bash
 jid=$(sbatch --parsable -p dev-g --nodes=2 --time=01:00:00 lumi/generate.sbatch \
     --model /scratch/project_465003062/environment/containers/grpo-pregen-rl/tildeopen --tp 2 \
-    --input examples/gsm8k.jsonl --output examples/gsm8k_rollouts.jsonl \
+    --input configs/examples/gsm8k.jsonl --output configs/examples/gsm8k_rollouts.jsonl \
     --samples-per-prompt 8 --max-tokens 2048)
 
 sbatch --dependency=after:$jid --nodes=2 -p small-g --time=01:00:00 lumi/judge.sbatch \
     --model Qwen/Qwen3-32B --tp 4 \
-    --input examples/gsm8k_rollouts.jsonl --output examples/gsm8k_judged.jsonl \
-    --judge judges/correctness --follow
+    --input configs/examples/gsm8k_rollouts.jsonl --output configs/examples/gsm8k_judged.jsonl \
+    --judge correctness --follow
 ```
 
 ## Generate, then judge after it finishes (old judge interface)
 
-`--template` no longer exists; today this is `--judge judges/correctness`.
+`--template` no longer exists; today this is `--judge correctness`.
 
 ```bash
 jid=$(sbatch --parsable --nodes=2 lumi/generate.sbatch ...)
 sbatch --dependency=afterok:$jid --nodes=1 lumi/judge.sbatch \
     --model Qwen/Qwen3-32B --tp 4 \
-    --input examples/rollouts.jsonl --output examples/judged.jsonl \
+    --input configs/examples/rollouts.jsonl --output configs/examples/judged.jsonl \
     --template judge_prompts/correctness.txt \
     --extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'
 ```

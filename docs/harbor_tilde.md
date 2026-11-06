@@ -160,7 +160,7 @@ The script:
 `--lumi-run` takes the job id (works while the job is still queued) or a run folder name from `logs/` on LUMI.
 Without it, the script uses LUMI's `logs/latest_run`. That is the newest job that has *started*, so a job id is
 safer. The API key is read from `~/.vllm_key` (`--api-key-file` to change). To skip retyping the LUMI flags,
-put the command in a run file, e.g. `runs/harbor_tb2.sh`, like the LUMI runs.
+put the command in a run file, e.g. `configs/runs/harbor_tb2.sh`, like the LUMI runs.
 
 Choosing what to run:
 - `--n-tasks 5`: at most 5 tasks, picked after the name filters below (default: all).

@@ -11,18 +11,14 @@ sbatch --nodes=4 lumi/generate.sbatch --model /scratch/.../policy-model --tp 2 \
 
 # 2. judge
 sbatch --nodes=2 lumi/judge.sbatch --model /scratch/.../judge-model --tp 4 \
-    --input data/rollouts.jsonl --output data/judged.jsonl --judge judges/correctness
-
-# 3. changed the reward formula in judges/correctness/rubric.toml? recompute, no GPUs needed
-#    (needs Python >= 3.11; on a LUMI login node: module load cray-python)
-python3 rollgen/rescore.py --input data/judged.jsonl --output data/judged_v2.jsonl --judge judges/correctness
+    --input data/rollouts.jsonl --output data/judged.jsonl --judge correctness
 ```
 
 Label a dataset (e.g. difficulty of each prompt; see [classifiers.md](classifiers.md)):
 ```bash
 sbatch --nodes=2 lumi/classify.sbatch --model /scratch/.../gemma-4-12B-it \
     --input data/so_openq.jsonl --output data/so_openq.difficulty.jsonl \
-    --classifier classifiers/difficulty --keep-fields uuid \
+    --classifier difficulty --keep-fields uuid \
     --extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'
 ```
 
@@ -64,4 +60,4 @@ keeps `concurrency x number of servers` requests in flight.
 
 A timed-out job can be resubmitted with the same command; it skips finished items.
 
-Per-experiment launch scripts: [`runs/`](../runs/) (`bash runs/<name>.sh`).
+Per-experiment launch scripts: [`configs/runs/`](../configs/runs/) (`bash configs/runs/<name>.sh`).

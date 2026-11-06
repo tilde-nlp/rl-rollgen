@@ -20,7 +20,7 @@
 # Submit from the repo root:
 #   sbatch --nodes=2 lumi/classify.sbatch --model /scratch/.../gemma-4-12B-it \
 #       --input data/so_openq.jsonl --output data/so_openq.difficulty.jsonl \
-#       --classifier classifiers/difficulty --keep-fields uuid \
+#       --classifier difficulty --keep-fields uuid \
 #       --extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'
 #
 # Arguments. Slurm options go before the script name, all other flags after it.
@@ -58,8 +58,8 @@
 #     --output FILE             (required) labels .jsonl, one line per record (record_idx + kept fields +
 #                               labels + classify_error); an existing file is resumed, same settings only
 #                               (--concurrency may differ; an edited classifier counts as different)
-#     --classifier DIR          (required) folder with prompt.txt/.json + rubric.toml (+ system.txt),
-#                               e.g. classifiers/difficulty
+#     --classifier NAME         (required) a folder in configs/classifiers/ (e.g. difficulty) or a path,
+#                               with config.py (Output + messages(record)); see docs/classifiers.md
 #     --keep-fields A,B         input fields copied to every output line, e.g. uuid (to join on)
 #     --temperature F           (default: 0.0)
 #     --max-tokens N            max tokens of the reply (default: 512)

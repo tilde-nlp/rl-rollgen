@@ -23,7 +23,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 # Args that may differ between resumed runs without changing what the output contains.
-RESUME_SAFE_ARGS = {"url", "servers", "concurrency", "check_args", "follow", "follow_timeout"}
+# (judge/classifier: only their location; their file contents are compared instead)
+RESUME_SAFE_ARGS = {"url", "servers", "concurrency", "check_args", "follow", "follow_timeout",
+                    "judge", "classifier"}
 FOLLOW_POLL_SECONDS = 30
 PROGRESS_SECONDS = 30  # print progress at most this often
 
@@ -76,6 +78,19 @@ def count_records(path):
 def read_records(path):
     """Read all input records from .jsonl or .parquet (e.g. a SkyRL/verl dataset)."""
     return list(iter_records(path))
+
+
+def resolve_config(value, kind, suffix=""):
+    """A config given by short name or path: `--judge gsm8k` -> configs/judges/gsm8k.
+    An existing path is used as given."""
+    if value is None or Path(value).exists():
+        return value
+    path = REPO / "configs" / kind / (value + suffix)
+    if path.exists():
+        return str(path.relative_to(Path.cwd())) if path.is_relative_to(Path.cwd()) else str(path)
+    names = sorted(p.name.removesuffix(suffix) for p in (REPO / "configs" / kind).iterdir()
+                   if not p.name.startswith(("_", ".")) and p.name.endswith(suffix))
+    sys.exit(f"{value}: no such path, and not one of configs/{kind}/: {', '.join(names)}")
 
 
 def get_messages(record):
@@ -192,6 +207,7 @@ def finish_meta(path, meta, **result):
 def run_resumable(items, worker, args, key, record=None, follow=None, total=None):
     """Call `await worker(item, client) -> list[dict]` for every item and append the returned
     records to `output` (JSONL) as soon as each item finishes (so in completion order).
+    A worker returning None skips the item (nothing written; it's looked at again on a rerun).
 
     `items`: a list, or any iterable (e.g. a generator streaming a big file; then pass `total`,
     the number of items, for progress and ETA). --concurrency x --servers requests are in flight.
@@ -216,11 +232,12 @@ def run_resumable(items, worker, args, key, record=None, follow=None, total=None
     meta_path, meta = start_meta(args, record=record)
     complete = True
     if follow:
-        n_ok, n_fail, complete = asyncio.run(
+        n_ok, n_fail, n_skip, complete = asyncio.run(
             _follow(*follow, worker, output, key, client, n_loops, done))
     else:
-        n_ok, n_fail = asyncio.run(_run(items, worker, output, key, client, n_loops, done, total))
-    finish_meta(meta_path, meta, items_ok=n_ok, items_failed=n_fail, **({} if complete else {"incomplete": True}))
+        n_ok, n_fail, n_skip = asyncio.run(_run(items, worker, output, key, client, n_loops, done, total))
+    finish_meta(meta_path, meta, items_ok=n_ok, items_failed=n_fail, items_skipped=n_skip,
+                **({} if complete else {"incomplete": True}))
     if n_fail or not complete:
         sys.exit(1)
 
@@ -242,24 +259,24 @@ async def _follow(load, producer_meta, timeout_min, worker, output, key, client,
     Items that fail are not retried in this process; rerun to retry them."""
     since = _now()
     attempted = set(done)
-    n_ok = n_fail = 0
+    n_ok = n_fail = n_skip = 0
     last_new = time.time()
     print(f"following {producer_meta.removesuffix('.meta.json')} (new lines every {FOLLOW_POLL_SECONDS}s)", flush=True)
     while True:
         finished = _producer_finished(producer_meta, since)  # check before loading: no line is missed
         new = [it for it in load() if it[key] not in attempted]
         if new:
-            ok, fail = await _run(new, worker, output, key, client, n_loops, set(), len(new))
+            ok, fail, skip = await _run(new, worker, output, key, client, n_loops, set(), len(new))
             attempted.update(it[key] for it in new)
-            n_ok, n_fail = n_ok + ok, n_fail + fail
+            n_ok, n_fail, n_skip = n_ok + ok, n_fail + fail, n_skip + skip
             last_new = time.time()
         elif finished:
             print("the generation run finished and all its lines are processed", flush=True)
-            return n_ok, n_fail, True
+            return n_ok, n_fail, n_skip, True
         elif time.time() - last_new > timeout_min * 60:
             print(f"WARNING: nothing new for {timeout_min:g} min and {producer_meta} shows no finished run; "
                   f"stopping. Rerun to process the rest.", flush=True)
-            return n_ok, n_fail, False
+            return n_ok, n_fail, n_skip, False
         await asyncio.sleep(FOLLOW_POLL_SECONDS)
 
 
@@ -294,15 +311,15 @@ async def _run(items, worker, output, key, client, n_loops, done, total=None):
           f"{n_loops} requests at a time", flush=True)
     output.parent.mkdir(parents=True, exist_ok=True)
     pending = iter(items)
-    n_ok = n_fail = n_skip = 0
+    n_ok = n_fail = n_done = n_skip = 0  # n_done: already in output; n_skip: worker returned None
     start = last_report = time.time()
 
     with open(output, "a", encoding="utf-8") as out:
         async def loop():
-            nonlocal n_ok, n_fail, n_skip, last_report
+            nonlocal n_ok, n_fail, n_done, n_skip, last_report
             for item in pending:  # shared: every item is taken by exactly one loop
                 if item[key] in done:
-                    n_skip += 1
+                    n_done += 1
                     continue
                 try:
                     records = await worker(item, client)
@@ -310,18 +327,22 @@ async def _run(items, worker, output, key, client, n_loops, done, total=None):
                     n_fail += 1
                     print(f"FAILED {key}={item[key]}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
                     continue
+                if records is None:
+                    n_skip += 1
+                    continue
                 for r in records:
                     out.write(json.dumps(r, ensure_ascii=False) + "\n")
                 out.flush()
                 n_ok += 1
                 if time.time() - last_report >= PROGRESS_SECONDS:
                     last_report = time.time()
-                    rate = (n_ok + n_fail) / (last_report - start)
-                    left = "" if total is None else (
-                        f", {total - n_ok - n_fail - n_skip} left, ETA {(total - n_ok - n_fail - n_skip) / 60 / rate:.0f} min")
-                    print(f"{n_ok} done, {n_fail} failed, {rate:.2f} items/s{left}", flush=True)
+                    rate = (n_ok + n_fail + n_skip) / (last_report - start)
+                    n_left = None if total is None else total - n_ok - n_fail - n_skip - n_done
+                    left = "" if total is None else f", {n_left} left, ETA {n_left / 60 / rate:.0f} min"
+                    print(f"{n_ok} done, {n_fail} failed, {n_skip} skipped, {rate:.2f} items/s{left}", flush=True)
 
         await asyncio.gather(*(loop() for _ in range(n_loops)))
 
-    print(f"finished: {n_ok} ok, {n_fail} failed, {n_skip} already done, {time.time() - start:.0f}s", flush=True)
-    return n_ok, n_fail
+    print(f"finished: {n_ok} ok, {n_fail} failed, {n_skip} skipped, {n_done} already done, "
+          f"{time.time() - start:.0f}s", flush=True)
+    return n_ok, n_fail, n_skip

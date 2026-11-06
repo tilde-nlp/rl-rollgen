@@ -1,13 +1,13 @@
 # Classifiers
 
 A classifier labels each record of a dataset (e.g. domain and difficulty of every prompt) with an LLM.
-It is a folder `classifiers/<name>/` in the same format as a [judge](judges.md), without a reward.
-Copy one to make a new classifier.
+It is a folder `configs/classifiers/<name>/` with a `config.py` (same format as a [judge](judges.md)).
+Copy one to make a new classifier; use it as `--classifier <name>` (or pass a folder path).
 
 ```bash
 sbatch --nodes=2 lumi/classify.sbatch --model /scratch/.../gemma-4-12B-it \
     --input data/so_openq.jsonl --output data/so_openq.difficulty.jsonl \
-    --classifier classifiers/difficulty --keep-fields uuid \
+    --classifier difficulty --keep-fields uuid \
     --extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'
 ```
 Without Slurm, against vLLM servers that already run (e.g. on Tilde): one server is `--url http://host:8000/v1`;
@@ -20,39 +20,83 @@ uv run --with openai rollgen/classify.py --url http://localhost:9000/v1 --server
 
 Output: a sidecar `.jsonl`, one line per input record:
 ```json
-{"record_idx": 0, "uuid": "...", "domain": "physics", "task_type": "conceptual_qa", "difficulty": "medium", "tools_needed": false, "classify_error": null}
-{"record_idx": 1, "uuid": "...", "domain": "math", "task_type": "proof", "difficulty": "hard", "tools_needed": null, "classify_error": null}
-{"record_idx": 2, "uuid": "...", "domain": null, "task_type": null, "difficulty": null, "tools_needed": null, "classify_error": "record has no field {expected_answer} ..."}
+{"record_idx": 0, "uuid": "...", "domain": "physics", "task_type": "conceptual_qa", "difficulty": "medium", "classify_error": null}
+{"record_idx": 1, "uuid": "...", "domain": "math", "task_type": "proof", "difficulty": "hard", "classify_error": null}
+{"record_idx": 2, "uuid": "...", "domain": null, "task_type": null, "difficulty": null, "classify_error": "configs/classifiers/difficulty/config.py line 57: messages() failed: KeyError: 'problem'"}
 ```
 - `record_idx`: input record number (from 0, blank lines not counted). Lines are in completion order, not input
   order: join on `record_idx` or a `--keep-fields` id.
-- One field per criterion; `null` for a `when` criterion that wasn't asked (`tools_needed` without tools).
-- `classify_error`: why a record has no labels (missing prompt field, unusable reply incl. the reply itself).
-- `reasoning` too, if the rubric has `reasoning = true`.
+- One field per field of `Output` (see below).
+- `classify_error`: why a record has no labels (`messages()` failed, or the reply doesn't fit `Output`; the
+  reply itself is included).
+- Records that `messages()` skips (returns `None`) get no line.
 
 The input is streamed (files of many GB are fine). Identical requests are sent once per run. A killed job is
 resumed by resubmitting the same command; resuming with other settings or an edited classifier is refused.
 
 ## Writing a classifier
 
-`classifiers/difficulty/` as the example:
-- `system.txt`: the instructions and the full rubric, sent as-is.
-- `prompt.json`: the user message as a JSON object, values filled from the record:
-  ```json
-  {"problem": "{problem}", "expected_answer": "{expected_answer}", "tools": "{responses_create_params[tools]?}"}
-  ```
-  `?` = optional: the key is left out if the record has no tools. (A `prompt.txt` text template works too.)
-- `rubric.toml`: the labels.
-  ```toml
-  reasoning = false        # just the labels, no free-text reasoning first
-  max_field_chars = 12000  # longer strings are cut, head and tail kept
+Start from `configs/classifiers/example/config.py`: a working classifier where every part is explained
+(`cp -r configs/classifiers/example configs/classifiers/my_labels`).
 
-  [criteria]
-  domain       = { type = "enum", values = ["math", "physics", "..."], question = "The main subject knowledge needed." }
-  difficulty   = { type = "enum", values = ["easy", "medium", "hard", "expert"], question = "..." }
-  tools_needed = { type = "bool", when = "responses_create_params[tools]", question = "..." }
-  ```
-  Fields are generated in this order. The questions are listed in the prompt where `{criteria}` stands; a
-  classifier whose `system.txt` describes the fields can leave `{criteria}` out.
+A classifier is plain Python: `config.py` says what the model must answer (`Output`) and builds the request
+for one record (`messages`). The smallest one:
 
-All file options: [judges.md](judges.md#folder-format).
+```python
+# configs/classifiers/is_math/config.py
+from typing import Literal
+from pydantic import BaseModel
+
+
+class Output(BaseModel):          # the labels; one output field each
+    is_math: bool
+    level: Literal["school", "university", "research"]
+
+
+def messages(record):             # one input record (dict) -> the request
+    return f"""Is this a math problem, and at what level?
+
+{record["problem"]}
+
+Answer as JSON: "is_math" (true/false), "level" (school, university or research)."""
+```
+Check it on the first record without GPUs or a server (`--check-args`; needs openai (pydantic comes with it),
+so on LUMI run it in the container, elsewhere `uv run --with openai python ...`):
+```bash
+python rollgen/classify.py --check-args --classifier is_math --input data/x.jsonl --output data/x.is_math.jsonl
+```
+
+`Output` is a [pydantic](https://docs.pydantic.dev/) model. It becomes the JSON schema that vLLM enforces
+(structured outputs), and the reply is checked against it. Types:
+- `bool`, `str`, `int`, `float`
+- `int = Field(ge=1, le=5)`: an integer 1-5 (`from pydantic import Field`)
+- `Literal["a", "b"]`: one of the given values
+- `int | None`: may be null
+
+Fields are generated in the order they're written, so a free-text `reasoning: str` first makes the model
+think before it answers (it then needs a larger `--max-tokens`). The schema enforces the shape, but the model
+only knows what a field *means* from your prompt, so describe the fields there.
+
+`messages(record)` returns:
+- a string: sent as one user message
+- a list of chat messages, e.g. `[{"role": "system", "content": ...}, {"role": "user", "content": ...}]`
+- `None`: skip this record (it gets no output line); filter whatever you like
+
+If it raises (e.g. `KeyError` for a field the record doesn't have), that record gets a `classify_error`.
+On the first record the job stops before it starts, so typos show up in `--check-args`. Different dataset
+shapes are handled right there with ordinary `if`s (see `configs/classifiers/difficulty/config.py`: plain,
+Nemotron-RL and chat `messages` records).
+
+Helpers (`from _ask import truncate`):
+- `truncate(text, n)`: cut text longer than `n` characters (head 2/3 + tail 1/3, `[... truncated ...]` between).
+
+Every file of the folder is stored in `<output>.meta.json`, so resuming with an edited classifier is refused.
+
+`configs/classifiers/difficulty/` as the full example:
+`config.py`: `SYSTEM`, the instructions and the rubric as one string, with `{tools_note}` replaced by a
+sentence saying whether the solver has tools; `Output` with `domain`, `task_type`, `difficulty` (each a
+`Literal`); `messages()` reads the record's problem, reference answer and tools (from whichever shape it has),
+cuts long texts to 12000 characters, and sends the system prompt plus the fields as a JSON user message.
+
+The input must be JSONL (one record per line) or parquet; a pretty-printed JSON dump can be converted with
+`jq -c . dump.json > data.jsonl`.

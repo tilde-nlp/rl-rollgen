@@ -1,5 +1,0 @@
-{
-  "problem": "{problem}",
-  "expected_answer": "{expected_answer}",
-  "tools": "{responses_create_params[tools]?}"
-}

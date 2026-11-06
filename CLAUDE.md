@@ -57,7 +57,7 @@ That script was the owner's working SkyRL training job on LUMI; the facts below 
     management) and hsn0-3 (10.253.x, Slingshot).
   - Login node `uan01` reaches a compute node's port 8000 by hsn0 IP and by hostname (checked 2026-11-05, dev-g).
     No direct ssh into compute nodes on LUMI. Networking details for Tilde: see "Harbor on Tilde" below.
-  - LUMI login-node system `python3` is too old for `tomllib` (rescore.py fails there). Run Python tools in the
+  - LUMI login-node system `python3` is too old / lacks openai/pydantic (judge/classifier configs, e.g. --check-args, fail there). Run Python tools in the
     container (`singularity run -B /scratch/project_465003062 $SIF python ...`). Offered, not yet built:
     `lumi/run.sh <cmd>` wrapper around `run_in_container` for login-node use.
   - The RCCL/libfabric tuning is only needed for multi-node NCCL (training weight sync).
@@ -81,12 +81,11 @@ rollgen/           # "native" to both clusters: the actual work (generate, judge
                    #   meta.json, --check-args
   generate.py      #   prompts .jsonl/.parquet -> n samples per prompt -> rollouts JSONL
                    #   (prompt: string | message list (SkyRL/verl) | "messages"); outputs stay JSONL (append/resume)
-  judge.py         #   rollouts JSONL -> + judge_output, judge_scores, reward, judge_error (--judge judges/<name>)
+  judge.py         #   rollouts JSONL -> + judge_output, judge_scores, judge_error (--judge configs/judges/<name>)
   classify.py      #   records .jsonl/.parquet -> sidecar labels JSONL (record_idx, --keep-fields, one field per
-                   #   criterion, classify_error) (--classifier classifiers/<name>); dedups identical requests
-  rescore.py       #   recompute `reward` from stored judge_scores with an edited formula (no GPUs)
-  _rubric.py       #   shared engine for judges + classifiers: loads a folder (prompt.txt|prompt.json, system.txt,
-                   #   rubric.toml), renders the prompt, JSON schema, parses replies, reward formula
+                   #   Output field, classify_error) (--classifier configs/classifiers/<name>); dedups identical requests
+  _ask.py          #   shared engine for judges + classifiers: loads <folder>/config.py (Output + messages()),
+                   #   JSON schema from Output, validates replies; helpers truncate/last_user_message
 lumi/              # LUMI-specific glue: Slurm, container, starting vLLM
   _common.sh       #   site config, parse_launcher_args, record_run, start_vllm_servers, start_router,
                    #   run_in_container (host side); apply_env, node_addr (container side)
@@ -106,15 +105,19 @@ tilde/             # Tilde-specific glue (plain bash, no Slurm)
   harbor_run.sh    #   one command: wait for a LUMI serve job's router (ssh lookup of <run>/urls/router.txt),
                    #   ssh -L tunnel to it, `harbor run -p data/harbor/...` with local Docker sandboxes,
                    #   close tunnel on exit -> logs/harbor/<job>/ (+ run.txt); --resume. Walkthrough: docs/harbor_tilde.md
-judges/            # one folder per judge: prompt.txt ({prompt}, {completion}, {answer}, {criteria}) +
-                   #   rubric.toml (reward formula + criteria); user content, not code
-classifiers/       # one folder per classifier, same format without reward (difficulty/: from the owner's
+configs/           # what users edit per experiment (user content, not code). Flags take short names:
+                   #   --judge gsm8k = configs/judges/gsm8k (rollgen/_common.py resolve_config; a path works too)
+  judges/          #   one folder per judge: config.py (example = annotated template; correctness, gsm8k, tool_use)
+  classifiers/     #   one folder per classifier: config.py (example = annotated template; difficulty/: from the owner's
                    #   difficulty_classifiers.py, gitignored at the repo root)
-examples/          # tiny example inputs for smoke tests
-runs/              # per-experiment launch scripts (bash runs/<name>.sh)
+  examples/        #   tiny example inputs for smoke tests
+  runs/            #   per-experiment launch scripts (bash configs/runs/<name>.sh)
 docs/              # all docs (index: docs/README.md). Top-level README.md is owner-written only
 logs/              # Slurm and vLLM logs (gitignored)
 ```
+Top level is kept to lumi/, tilde/, rollgen/, configs/, docs/ (owner's wish, 2026-11-06); new user content goes
+under configs/. Moving a config folder doesn't break resuming: the judge/classifier paths are
+resume-safe args (their file contents are compared instead).
 Rule: `rollgen/` holds the real logic and runs unchanged on both clusters; it only knows vLLM URLs.
 Anything cluster-specific (Slurm, containers, GPU env vars, paths) lives in `lumi/` or `tilde/`.
 Naming: files users run have plain names; internals have a `_` prefix and live next to what uses them
@@ -131,7 +134,7 @@ Sbatch files must be submitted from the repo root (they use `$SLURM_SUBMIT_DIR`)
 - `bash lumi/<entry>.sbatch --help` works on a login node: launcher flags plus the Python script's --help.
 - **Same flags on both clusters** (tilde/ launchers must mirror lumi/).
 - **Fail before vLLM starts:** launchers run the Python script with the hidden `--check-args` first
-  (argparse typos, missing input, bad judge prompt/rubric, resume-with-different-settings).
+  (argparse typos, missing input, bad judge config / messages() failing on record 0, resume-with-different-settings).
 - **Every run is recorded** (the owner's main pain was tracking changes between runs):
   - `<output>.meta.json` (written by rollgen/, so cluster-agnostic): list of runs with settings, model path,
     git commit + dirty flag, host, job id, timing, ok/failed counts.
@@ -140,40 +143,43 @@ Sbatch files must be submitted from the repo root (they use `$SLURM_SUBMIT_DIR`)
     `<node>-vllm-<i>.log`, `urls/` (only while the servers run; removed on exit so a dead job never looks alive).
     `logs/latest_run` is a symlink to the newest run folder.
   - Resuming into an existing output with different settings is refused (only `url`, `servers`, `concurrency` may differ).
-- Per-experiment run files live in `runs/<name>.sh`: plain bash holding the sbatch command(s), `cd` to the repo
-  root first, run with `bash runs/<name>.sh`. No special support; what actually ran is in `logs/<run>/run.txt`.
+- Per-experiment run files live in `configs/runs/<name>.sh`: plain bash holding the sbatch command(s), `cd` to the repo
+  root first, run with `bash configs/runs/<name>.sh`. No special support; what actually ran is in `logs/<run>/run.txt`.
   If colleagues want more, revisit "one run file per experiment" (variant B).
 
-## Judging design (decided 2026-11-05)
-- Scoring must be configurable outside the code: a judge = `judges/<name>/{prompt.txt,rubric.toml}`.
-- The judge only answers rubric questions (bool, or int with min/max) as JSON; vLLM structured outputs enforce
-  the schema (`response_format` json_schema, with a free-text `reasoning` field first). The judge never does arithmetic.
-- `reward` is a one-line Python expression over criterion names, evaluated with no builtins except
-  min/max/abs/round; names and attribute access are checked up front. Trusted-team tool, not a sandbox.
-- Reweighting is free: `rescore.py` recomputes rewards from stored `judge_scores`. Changed questions need a re-judge.
-- prompt.txt|json, system.txt and rubric.toml contents are stored in meta.json settings, so resuming with an edited judge is refused.
-- TOML (stdlib `tomllib`) because nothing extra is needed in the container. Gotcha: `reward` must be above `[criteria]`.
-- Old `--template`/`--score-regex` interface removed (one way to judge).
+## Judges and classifiers (config.py format decided 2026-11-06, replaced prompt.txt/rubric.toml)
+- A judge/classifier = a folder `configs/{judges,classifiers}/<name>/` with `config.py` (system prompt included
+  as a string; owner rejected jinja templates, 2026-11-06: no extra dependency). config.py defines `class Output(pydantic.BaseModel)` (the answer fields; its JSON schema
+  goes to vLLM structured outputs via `response_format` json_schema, the reply is validated with it) and
+  `messages(record)` -> chat messages | str (one user message) | None (skip: no output line, `items_skipped`
+  in meta.json; re-evaluated on rerun, cheap). Exceptions -> error line; on record 0 -> stop (--check-args).
+- Why (owner, 2026-11-06): rubric.toml mixed schema, question text, `when`/`[text]` conditionals and settings
+  into a small DSL; `--input-format` Python was already the intuitive part. Now one way: plain Python.
+  `configs/formats/` and `--input-format` are gone; dataset shapes are handled inside messages()
+  (difficulty reads plain/Nemotron-RL/chat-messages records itself, so tools can no longer be silently missing).
+- Deps: only pydantic, which comes with openai (already needed). `from _ask import truncate, last_user_message`
+  in configs (rollgen/ is on sys.path when the scripts run).
+- The judge only answers questions (no arithmetic, no reward: removed 2026-11-06, a colleague said the computed
+  reward isn't what we want). Output: `judge_scores` (all Output fields, incl. reasoning if declared) +
+  `judge_output` (raw reply) + `judge_error`. Reward is up to the training side.
+- Every file of the folder is stored in meta.json settings as `<judge|classifier>_file <name>`, so resuming
+  with an edited config is refused (the message names the changed file). Outputs started with the old
+  rubric format can't be resumed with the new one (settings keys differ).
+- difficulty: SYSTEM (in config.py) is byte-identical to the old system.txt with `{tools_note}` filled
+  (checked 2026-11-06). Requests match difficulty_classifiers.py no longer (system text + schema since the tools
+  change; old folder in git, commit 4a62bbb). Pydantic's schema adds `title` keys (harmless).
+  The tools sentence is factual only: how tools should weigh on difficulty is not specified (owner's call).
+  Owner doesn't want `tools_needed` graded (knows it from the data).
 - `judge.py --follow`: judge job runs alongside generation (`--dependency=after:`), re-reads the growing rollouts
   file every 30s (ignores an unfinished last line; rollout_idx = line number, stable because generate only appends),
   stops when the newest run in `<input>.meta.json` finished after the judge started, or after `--follow-timeout`
   minutes without new lines (then exit 1, run marked `incomplete`). Failed items aren't retried within one run.
-
-## Classifiers (decided 2026-11-06)
-- Owner wants many classify/judge jobs, each just 2-3 config files. So one engine (`_rubric.py`) and one folder
-  format for both; `judge.py` and `classify.py` are thin (they differ in input, output shape, reward).
-- Folder: `prompt.txt` (text template) or `prompt.json` (user message as a JSON object, the owner's style in
-  difficulty_classifiers.py), optional `system.txt` (verbatim, no placeholders), `rubric.toml`.
-- Placeholders: `{a[b][0]}`, `{x?}` optional (left out if missing/empty), strings as-is, others as JSON. Missing
-  required field -> error line for that record; missing in record 0 -> stop before starting (typo check).
-- rubric.toml additions: `enum` type (values), `when = "field"` (ask only if present, else null), `reasoning =
-  false`, `max_field_chars` (head 2/3 + tail 1/3, marker as in the original). Classifiers must not have `reward`.
-- `classifiers/difficulty/` sends byte-identical requests (system, user JSON, schema) to difficulty_classifiers.py
-  (checked on synthetic records 2026-11-06). Differences: sidecar lines in completion order with `record_idx`
-  (original: input order), `classify_error` instead of `_classification_skipped/_error`, failed server requests
-  are retried on rerun (original: written as skipped after 5 tries), thinking off via `--extra-body`.
-- Client throughput: ~450 req/s per process, CPU-bound in the openai client (our code ~2%); enough for realistic
-  node counts. Memory stays flat on large inputs (672 MB input -> 133 MB RSS).
+- classify.py: sidecar lines in completion order with `record_idx`, `classify_error`, failed server requests
+  are retried on rerun, thinking off via `--extra-body`. Dedups identical requests (sha1 of messages).
+- Client throughput (measured with the old engine): ~450 req/s per process, CPU-bound in the openai client;
+  memory flat on large inputs (672 MB input -> 133 MB RSS).
+- Tested locally (2026-11-06) with a fake vLLM server: classify on plain/Nemotron/chat records, dedup, error
+  lines, resume, judge gsm8k, skip via None, edited-config refusal. Not yet run on LUMI with a real model.
 - No tilde/ launcher yet (no one-step Tilde launchers exist); there: `uvx --from vllm-router==0.1.16 vllm-router`
   in front of the servers, then classify.py --url <router> --servers N (docs/classifiers.md; tested locally).
 
@@ -220,7 +226,7 @@ Harbor layout (decided 2026-11-05; facts from harbor 0.20.0 source):
   failed), different config = error. `harbor jobs resume -p <job>` drops CancelledError trials and reruns them
   (needs HOSTED_VLLM_API_KEY in env). Ctrl-C/SIGTERM cancel trials, recover outputs, tear down containers.
 - harbor_run.sh (decided 2026-11-06: attach to a serve job, never submits/scancels it; LUMI config by flags, put
-  them in a runs/<name>.sh): `-p`, `--lumi-host [user@]host` (default lumi-uan01.csc.fi), `--lumi-repo` (required
+  them in a configs/runs/<name>.sh): `-p`, `--lumi-host [user@]host` (default lumi-uan01.csc.fi), `--lumi-repo` (required
   unless `--url`), `--lumi-run JOBID|RUN` (default latest_run; job id works while queued: run dir = logs/*-<jobid>),
   `--wait MIN` (60), `--local-port` (18000), `--url` (no LUMI/tunnel), `--api-key-file` (default ~/.vllm_key,
   required), `--agent`, `-n`, `--max-output-tokens`, `--max-input-tokens` (default ctx - max output), `--job-name`,
@@ -280,7 +286,7 @@ requests, setproctitle; orjson installed alongside) and run in the container wit
 
 Remaining in tilde/: a tunnel dying mid-run is not restarted (trials then fail; resume after). Next: measure vLLM
 prefix-cache hit rate per server (`vllm:prefix_cache_*` in /metrics); later
-`rollgen/harbor_export.py` -> rollouts JSONL (then judges/tool_use applies).
+`rollgen/harbor_export.py` -> rollouts JSONL (then configs/judges/tool_use applies).
 Agents running inside the sandbox (not terminus-2) would need the tunnel bound to the docker bridge, not 127.0.0.1.
 127.0.0.1 on Tilde is shared by all users there -> always use the API key.
 
@@ -297,5 +303,5 @@ Agents running inside the sandbox (not terminus-2) would need the tunnel bound t
   stopped cleanly at the end, `serve.sbatch` on real hardware, the judge's JSON structured outputs with
   Qwen3-32B (check `judge_error` in judged output; pass `--extra-body '{"chat_template_kwargs":
   {"enable_thinking": false}}'`).
-- Launch commands: `runs/*.sh` (GSM8K: `runs/gsm8k_tildeopen.sh`, judge on small-g). `docs/examples.md` (gitignored)
+- Launch commands: `configs/runs/*.sh` (GSM8K: `configs/runs/gsm8k_tildeopen.sh`, judge on small-g). `docs/examples.md` (gitignored)
   still holds older notes; its GSM8K example puts both jobs on dev-g, which the dev_g QOS forbids.

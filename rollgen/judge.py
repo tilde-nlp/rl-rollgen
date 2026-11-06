@@ -1,19 +1,15 @@
 """Score rollouts with an LLM judge served by vLLM.
 
 Input: rollouts .jsonl (e.g. from generate.py), one rollout per line, or .parquet.
-Judge: a folder judges/<name>/ with prompt.txt (or prompt.json), rubric.toml and optionally
-system.txt (see rollgen/_rubric.py and docs/judges.md). The judge answers each rubric question as
-JSON; the reward is then computed from those answers with the rubric's formula. Change the formula
-later without re-judging: rollgen/rescore.py.
-
-{prompt} in the prompt: if a rollout has its prompt as chat messages ("messages", or "prompt"
-as a list), it is the last user message.
+Judge: a folder configs/judges/<name>/ with config.py: class Output (what the judge answers) and
+messages(record) (the request; None skips the rollout). See rollgen/_ask.py and docs/judges.md.
+The answers are stored as they are (no reward is computed).
 
 Output JSONL, one line per rollout:
   <rollout fields> + rollout_idx (input record number), judge_output (raw reply),
-  judge_scores ({criterion: answer}), reward, judge_error (null, or why there is no usable reply,
-  e.g. a missing prompt field; then judge_scores and reward are null. If only the reward formula
-  failed, judge_scores are kept: fix the formula and run rescore.py)
+  judge_scores (the reply's Output fields), judge_error (null, or why there is no usable reply,
+  e.g. messages() failed or the reply doesn't fit Output; then judge_scores is null)
+Rollouts that messages() skips get no line.
 
 Judge while generating (--follow): start this job while generate.py is still writing --input;
 new rollouts are judged as they appear (checked every 30s). Stops when the generation run
@@ -24,21 +20,21 @@ Resumable: rerun with the same arguments and finished rollouts are skipped.
 Each run is recorded in <output>.meta.json, including the judge folder's files.
 
 Example:
-  python rollgen/judge.py --input rollouts.jsonl --output judged.jsonl --judge judges/correctness
+  python rollgen/judge.py --input rollouts.jsonl --output judged.jsonl --judge correctness
 """
 
 import argparse
 import json
 
-from _common import add_server_args, count_records, iter_records, read_growing_jsonl, run_resumable
-from _rubric import Rubric
+from _common import add_server_args, count_records, iter_records, read_growing_jsonl, resolve_config, run_resumable
+from _ask import Config
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--input", required=True)
     p.add_argument("--output", required=True)
-    p.add_argument("--judge", required=True, help="judge folder with prompt.txt and rubric.toml")
+    p.add_argument("--judge", required=True, help="name in configs/judges/ (e.g. correctness) or a folder path")
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--max-tokens", type=int, default=2048)
     p.add_argument("--extra-body", type=json.loads, default={},
@@ -53,8 +49,8 @@ def main():
     if args.follow and not args.input.endswith(".jsonl"):
         p.error("--follow needs a .jsonl --input")
 
-    judge = Rubric(args.judge, need_reward=True)
-    judge.check_reward()
+    args.judge = resolve_config(args.judge, "judges")
+    judge = Config(args.judge)
 
     def rollouts():
         # rollout_idx = record number: stable, since generate.py only appends
@@ -67,15 +63,12 @@ def main():
         return records
 
     async def worker(r, client):
-        scores, text, error = await judge.ask(client, args.served_name, r, args.temperature,
-                                              args.max_tokens, args.extra_body)
-        reward = None
-        if scores is not None:
-            try:
-                reward = judge.reward(scores)
-            except Exception as e:  # scores are kept: fix the formula, then rollgen/rescore.py
-                error = f"reward formula failed: {type(e).__name__}: {e}"
-        return [{**r, "judge_output": text, "judge_scores": scores, "reward": reward, "judge_error": error}]
+        result = await judge.ask(client, args.served_name, r, args.temperature,
+                                 args.max_tokens, args.extra_body)
+        if result is None:
+            return None  # skipped by messages()
+        scores, text, error = result
+        return [{**r, "judge_output": text, "judge_scores": scores, "judge_error": error}]
 
     record = judge.record("judge")
     if args.follow:

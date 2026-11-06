@@ -18,7 +18,7 @@
 #
 # Submit from the repo root:
 #   sbatch --nodes=2 lumi/judge.sbatch --model /scratch/.../judge-model --tp 4 \
-#       --input data/rollouts.jsonl --output data/judged.jsonl --judge judges/correctness
+#       --input data/rollouts.jsonl --output data/judged.jsonl --judge correctness
 #
 # Chain after a generation job:
 #   jid=$(sbatch --parsable lumi/generate.sbatch ...)
@@ -58,7 +58,8 @@
 #     --input FILE              (required) rollouts .jsonl/.parquet from generate (still growing with --follow)
 #     --output FILE             (required) judged .jsonl; an existing file is resumed, same settings only
 #                               (--concurrency may differ; an edited judge counts as different)
-#     --judge DIR               (required) judge folder with prompt.txt + rubric.toml, e.g. judges/correctness
+#     --judge NAME              (required) a folder in configs/judges/ (e.g. correctness) or a path,
+#                               with config.py (Output + messages(record)); see docs/judges.md
 #     --temperature F           (default: 0.0)
 #     --max-tokens N            max tokens of the judge's reply (default: 2048)
 #     --extra-body JSON         extra sampling params for vLLM; for Qwen3 judges:
