@@ -1,7 +1,9 @@
 #!/bin/bash
 # How much text would the difficulty classifier receive per SFT stage-1 file, and how much would a lower
 # MAX_CHARS (configs/classifiers/difficulty/config.py) save? Only reads the files; no model or GPU involved.
-# Fast: about 2000 records per file, read by jumping through the file, 8 files at a time.
+# About as fast as test.sh: reads each file once in order, 8 files at a time, and parses only every Nth record
+# (~2000 per file). Sampling by record number, not by file position, so long records aren't over-represented.
+# Rows print as files finish, so not in list order.
 # Lengths follow the classifier's logic: problem = system + user messages before the first assistant reply,
 # answer = the last assistant message of a single-turn record, tools are never cut. System prompt not included.
 #
@@ -9,10 +11,10 @@
 set -euo pipefail
 cd /scratch/project_465003062/data/tilde-think
 python3 - <<'EOF'
-import json, os
+import json
 from multiprocessing import Pool
 
-SAMPLES = 2000     # per file
+SAMPLES = 2000     # per file, about
 CAPS = [12000, 6000, 3000]
 PROCESSES = 8
 
@@ -60,18 +62,9 @@ def lengths(r):
 
 
 def sample_lines(path, records):
-    with open(path, "rb") as f:
-        if records <= SAMPLES:
-            return [line for line in f if line.strip()]
-        size = os.path.getsize(path)
-        lines = []
-        for k in range(SAMPLES):
-            f.seek(k * size // SAMPLES)
-            f.readline()  # skip the line we landed in: long lines get landed in more often
-            line = f.readline()
-            if line.strip():
-                lines.append(line)
-        return lines
+    step = max(1, records // SAMPLES)
+    with open(path, "rb", buffering=1 << 20) as f:
+        return [line for i, line in enumerate(f) if i % step == 0 and line.strip()]
 
 
 def measure(item):
@@ -84,10 +77,10 @@ def measure(item):
     return path, records, len(rows), full[len(full) // 2], full[len(full) * 9 // 10], over, tools, sent
 
 
-print("%-71s %7s %7s %7s %6s %7s  mean chars sent at cap %s" % ("file", "sampled", "p50", "p90", "%>12k", "tools", CAPS))
+print("%-71s %7s %7s %7s %6s %7s  mean chars sent at cap %s" % ("file", "sampled", "p50", "p90", "%>12k", "tools", CAPS), flush=True)
 total = [0.0] * len(CAPS)
 with Pool(PROCESSES) as pool:
-    for path, records, n, p50, p90, over, tools, sent in pool.imap(measure, FILES):
+    for path, records, n, p50, p90, over, tools, sent in pool.imap_unordered(measure, FILES):
         total = [t + s * records for t, s in zip(total, sent)]
         print("%-71s %7d %7d %7d %6.1f %7d  %s" % (path, n, p50, p90, over, tools, " ".join("%7d" % s for s in sent)),
               flush=True)
