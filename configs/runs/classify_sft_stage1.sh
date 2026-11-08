@@ -1,6 +1,7 @@
 #!/bin/bash
 # Difficulty labels (configs/classifiers/difficulty) for the SFT stage-1 candidates, judged by Gemma 4 31B-it
-# (same model and settings as classify_sft_stage0.sh, so its two syn_mcq outputs are resumed, not redone).
+# (same model as classify_sft_stage0.sh). --keep-fields uuid is a new setting: outputs written without it
+# (e.g. stage 0's two syn_mcq files) can't be resumed, so move them aside before running this.
 # File list copied on 2026-11-06 from /scratch/project_465003062/data/tilde-think/sft-stage1-candidates.txt.
 # ONE job for all files (vLLM starts once); the labels go next to each input:
 #   <name>.jsonl -> <name>.difficulty.jsonl (+ <name>.difficulty.jsonl.meta.json)
@@ -38,7 +39,7 @@ FILES=(
 )
 INPUTS=("${FILES[@]/#/$DATA/}")
 ARGS=(--input "${INPUTS[@]}" --output-suffix .difficulty.jsonl
-      --classifier difficulty
+      --classifier difficulty --keep-fields uuid
       --extra-body '{"chat_template_kwargs": {"enable_thinking": false}}')
 
 # 1. Check every file before submitting (a missing field or another record shape shows up here,
@@ -47,5 +48,5 @@ run_in_container python rollgen/classify.py --check-args "${ARGS[@]}"
 [ "${1:-}" = "--check" ] && exit 0
 
 # 2. Submit. 4 nodes x 4 servers (TP=2) = 16 Gemma servers behind the router.
-sbatch -p standard-g --nodes=4 --time=24:00:00 lumi/classify.sbatch --model google/gemma-4-31B-it --tp 2 \
+sbatch -p standard-g --nodes=4 --time=08:00:00 lumi/classify.sbatch --model google/gemma-4-31B-it --tp 2 \
     --compile-cache "$COMPILE_CACHE" "${ARGS[@]}"
