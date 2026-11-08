@@ -1,5 +1,6 @@
 #!/bin/bash
-# Difficulty labels (configs/classifiers/difficulty) for the SFT stage-1 candidates, judged by Qwen3-32B.
+# Difficulty labels (configs/classifiers/difficulty) for the SFT stage-1 candidates, judged by Gemma 4 31B-it
+# (same model and settings as classify_sft_stage0.sh, so its two syn_mcq outputs are resumed, not redone).
 # File list copied on 2026-11-06 from /scratch/project_465003062/data/tilde-think/sft-stage1-candidates.txt.
 # ONE job for all files (vLLM starts once); the labels go next to each input:
 #   <name>.jsonl -> <name>.difficulty.jsonl (+ <name>.difficulty.jsonl.meta.json)
@@ -30,7 +31,7 @@ FILES=(
     _merged/coding-v2/competitive_programming_python.reason.no_tools.jsonl
     _merged/coding-v2/text_to_sql.reason.no_tools.jsonl
     _merged/infinibyte/all.reason.no_tools.jsonl
-    _merged/finance-doc/all.reason.no_tools.jsonl
+    _merged/finance-doc/all.reason.no_tools_uuid.jsonl   # made by add_uuid.sh (the original has no uuid)
     _merged/arc/raw/small_reasoning_and_tools.jsonl
     _merged/arc/raw/small_reasoning_no_tools.jsonl
     _merged/agentic-v4/raw/tool_calling.jsonl
@@ -45,6 +46,6 @@ ARGS=(--input "${INPUTS[@]}" --output-suffix .difficulty.jsonl
 run_in_container python rollgen/classify.py --check-args "${ARGS[@]}"
 [ "${1:-}" = "--check" ] && exit 0
 
-# 2. Submit. 4 nodes x 2 servers (TP=4) = 8 Qwen3-32B servers behind the router.
-sbatch -p standard-g --nodes=4 --time=24:00:00 lumi/classify.sbatch --model Qwen/Qwen3-32B --tp 4 \
+# 2. Submit. 4 nodes x 4 servers (TP=2) = 16 Gemma servers behind the router.
+sbatch -p standard-g --nodes=4 --time=24:00:00 lumi/classify.sbatch --model google/gemma-4-31B-it --tp 2 \
     --compile-cache "$COMPILE_CACHE" "${ARGS[@]}"
