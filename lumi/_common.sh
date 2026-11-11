@@ -34,7 +34,9 @@ LAUNCHER_HELP='Launcher flags (consumed here, everything else goes to the Python
   --no-stage-model        load the model from Lustre instead of copying it to node-local /tmp first
   --startup-timeout SEC   max wait for all vLLM servers to become healthy (default 1800)
   --compile-cache DIR     keep vLLM/Triton/MIOpen compile caches in DIR (e.g. on /scratch) so later jobs
-                          start faster; default: node-local /tmp, recompiled every job
+                          start faster; default: node-local /tmp, recompiled every job.
+                          Avoid on many nodes: 128 servers compiling into one shared cache crashed
+                          at startup ("@jit functions should be defined in a Python file")
   --api-key-file FILE     servers require this key (file holds one line; chmod 600). Without it, anyone
                           on the LUMI network can use the servers while the job runs
   --router-policy NAME    how vllm-router spreads requests over the servers: round_robin (default), or

@@ -48,8 +48,14 @@ That script was the owner's working SkyRL training job on LUMI; the facts below 
     TRITON_CACHE_DIR, MIOpen, XDG_CACHE_HOME) and the staged model live in `$NODE_TMP=/tmp/$USER-rollgen-$SLURM_JOB_ID`
     (node-local RAM), removed when the job ends. Cost: torch.compile runs from scratch every job.
     Optional `--compile-cache DIR` (e.g. on /scratch, never $HOME) keeps vLLM/Inductor/Triton/MIOpen caches across
-    jobs; it's bind-mounted into the container. Concurrent writes from many servers into one shared cache
-    are untested on LUMI.
+    jobs; it's bind-mounted into the container. **Don't use it on many nodes** (seen 2026-11-10, job 23601034,
+    classify_sft_stage1 on 32 nodes = 128 Gemma-4-31B servers, TP=2, shared cache on /scratch): servers died at
+    startup in torch.compile with `InductorError: RuntimeError: Failed to run autotuning code block: @jit
+    functions should be defined in a Python file`. Likely cause: many servers write the same compiled kernels into
+    the shared Lustre dir, so one reads another's half-written .py file. This was not proven. The
+    configs/runs classify scripts no longer pass it (2026-11-11). That cache dir
+    (`/scratch/project_465003062/environment/rollgen-compile-cache`) may hold broken files: move it aside
+    before reusing it. Untested idea if startup time matters: fill the cache with a 1-node job first.
   - Stage model weights to `/tmp` before loading (much faster than mmap from Lustre).
   - `PYTHONNOUSERSITE=1`, `VLLM_WORKER_MULTIPROC_METHOD=spawn`.
   - Use the `hsn0` (Slingshot) IP for cross-node traffic. The container has **no `ip` command** (checked
@@ -99,6 +105,8 @@ lumi/              # LUMI-specific glue: Slurm, container, starting vLLM
                    #   (completion with key = 200, without = 401), write <run dir>/urls/router.txt
   install_router.sh #  one-time per clone, login node (every job needs it): pip --no-deps --target
                    #   lumi/vllm-router/ (gitignored), pinned
+  throughput.sh    #   [RUN_DIR] -> token throughput from the vLLM stats lines in <run>/*-vllm-*.log
+                   #   (per server busy averages + all servers per hour); grep/sed/awk only
 tilde/             # Tilde-specific glue (plain bash, no Slurm)
   install.sh       #   one-time: uv + `uv tool install harbor==<pin>` (Docker assumed present)
   download_dataset.sh #   Harbor registry dataset -> data/harbor/<name>@<version>/<task>/

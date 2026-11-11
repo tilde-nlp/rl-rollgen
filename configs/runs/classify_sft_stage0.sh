@@ -14,8 +14,6 @@ cd "$(dirname "$0")/../.."
 source lumi/_common.sh   # SIF, BINDS, run_in_container (for the check)
 
 DATA=/scratch/project_465003062/data/tilde-think
-# vLLM/Inductor/Triton/MIOpen compile caches kept across jobs (the first job fills it, later ones start faster)
-COMPILE_CACHE=/scratch/project_465003062/environment/rollgen-compile-cache
 FILES=(
     _merged/science/syn_mcq.reason.no_tools.jsonl
     _merged/science/syn_mcq.reason.tools.jsonl
@@ -30,5 +28,4 @@ run_in_container python rollgen/classify.py --check-args "${ARGS[@]}"
 [ "${1:-}" = "--check" ] && exit 0
 
 # 2. Submit. 2 nodes x 4 servers (TP=2) = 8 Gemma servers behind the router.
-sbatch -p dev-g --nodes=2 --time=01:00:00 lumi/classify.sbatch --model google/gemma-4-31B-it --tp 2 \
-    --compile-cache "$COMPILE_CACHE" "${ARGS[@]}"
+sbatch -p dev-g --nodes=2 --time=01:00:00 lumi/classify.sbatch --model google/gemma-4-31B-it --tp 2 "${ARGS[@]}"

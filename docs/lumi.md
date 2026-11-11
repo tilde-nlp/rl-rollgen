@@ -61,4 +61,7 @@ keeps `concurrency x number of servers` requests in flight.
 
 A timed-out job can be resubmitted with the same command; it skips finished items.
 
+Token throughput of a job's vLLM servers (per server, and all together per hour), from their logs:
+`bash lumi/throughput.sh [logs/<run>]` (default `logs/latest_run`; works during or after the job).
+
 Per-experiment launch scripts: [`configs/runs/`](../configs/runs/) (`bash configs/runs/<name>.sh`).
