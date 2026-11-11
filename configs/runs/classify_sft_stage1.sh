@@ -16,6 +16,7 @@ cd "$(dirname "$0")/../.."
 source lumi/_common.sh   # SIF, BINDS, run_in_container (for the check)
 
 DATA=/scratch/project_465003062/data/tilde-think
+MODEL=google/gemma-4-31B-it
 FILES=(
     _merged/math/all.reason.no_tools.jsonl
     _merged/math/all.reason.tools.jsonl
@@ -42,8 +43,10 @@ ARGS=(--input "${INPUTS[@]}" --output-suffix .difficulty.jsonl
 
 # 1. Check every file before submitting (a missing field or another record shape shows up here,
 #    not after waiting in the queue). The job checks again at start, before vLLM loads.
-run_in_container python rollgen/classify.py --check-args "${ARGS[@]}"
+# MODEL_DIR/SERVED_NAME as the launcher sets them in the job, so resuming a started output passes the check.
+MODEL_DIR=$(resolve_model_dir "$MODEL") SERVED_NAME=$(basename "$MODEL") \
+    run_in_container python rollgen/classify.py --check-args "${ARGS[@]}"
 [ "${1:-}" = "--check" ] && exit 0
 
 # 2. Submit. 32 nodes x 4 servers (TP=2) = 128 Gemma servers behind the router.
-sbatch -p standard-g --nodes=32 --time=08:00:00 lumi/classify.sbatch --model google/gemma-4-31B-it --tp 2 "${ARGS[@]}"
+sbatch -p standard-g --nodes=32 --time=02:00:00 lumi/classify.sbatch --model "$MODEL" --tp 2 "${ARGS[@]}"
