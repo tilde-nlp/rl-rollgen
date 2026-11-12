@@ -49,4 +49,11 @@ MODEL_DIR=$(resolve_model_dir "$MODEL") SERVED_NAME=$(basename "$MODEL") \
 [ "${1:-}" = "--check" ] && exit 0
 
 # 2. Submit. 32 nodes x 4 servers (TP=2) = 128 Gemma servers behind the router.
-sbatch -p standard-g --nodes=32 --time=02:00:00 lumi/classify.sbatch --model "$MODEL" --tp 2 "${ARGS[@]}"
+# Expected (2026-11-11): a busy server does ~6,500-7,500 input chars/s, so 128 servers need ~4-4.5 h for the
+# ~12.6 billion chars left (cpp rest, python, text_to_sql, infinibyte, finance-doc, arc, tool_calling),
+# plus ~15 min vLLM startup per job. More nodes: scale --time down, but the single client process sends
+# at most ~300-400 requests/s (these files need ~165/s on 32 nodes), so beyond ~64 nodes servers would idle.
+# --concurrency 24 (per server): the servers are full with ~20 requests each (prefill-bound), and fewer
+# open connections keep the client fast. Resume-safe, so started outputs continue.
+sbatch -p standard-g --nodes=32 --time=06:00:00 lumi/classify.sbatch --model "$MODEL" --tp 2 \
+    --concurrency 24 "${ARGS[@]}"

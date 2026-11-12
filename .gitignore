@@ -9,3 +9,4 @@ lumi/.vllm-router-*/
 difficulty_classifiers.py
 test.jsonl
 test.sh
+*.patch

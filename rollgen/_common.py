@@ -144,7 +144,7 @@ def make_client(args, connections):
     # API_KEY_FILE: set by the launcher's --api-key-file (the servers then require the key)
     key_file = os.environ.get("API_KEY_FILE")
     api_key = Path(key_file).read_text().splitlines()[0].strip() if key_file else "EMPTY"
-    # one kept-open connection per in-flight request (openai's default: at most 1000, 100 kept open)
+    # one kept-open connection per in-flight request of this client (openai's default: at most 1000, 100 kept open)
     http = DefaultAsyncHttpxClient(limits=httpx.Limits(max_connections=connections,
                                                        max_keepalive_connections=connections))
     return AsyncOpenAI(base_url=args.url, api_key=api_key, timeout=3600, max_retries=3, http_client=http)
@@ -227,17 +227,21 @@ def run_resumable(items, worker, args, key, record=None, follow=None, total=None
         start_meta(args, dry_run=True, record=record)
         print(f"arguments OK ({total if total is not None else '?'} items)")
         return True
+    # One client (= one connection pool) per server, each with --concurrency connections; all point at the
+    # same URL. Not one big pool: httpx scans all of a pool's connections on every request, so with 8192
+    # connections (128 servers) one pool capped the client at ~60 requests/s and the servers sat idle
+    # (job 23640579, 2026-11-11).
     n_loops = args.concurrency * args.servers
-    client = make_client(args, n_loops)
+    clients = [make_client(args, args.concurrency) for _ in range(args.servers)]
     output = Path(args.output)
     done = _done_keys(output, key)  # before start_meta: a refusal here leaves no unfinished run behind
     meta_path, meta = start_meta(args, record=record)
     complete = True
     if follow:
         n_ok, n_fail, n_skip, complete = asyncio.run(
-            _follow(*follow, worker, output, key, client, n_loops, done))
+            _follow(*follow, worker, output, key, clients, n_loops, done))
     else:
-        n_ok, n_fail, n_skip = asyncio.run(_run(items, worker, output, key, client, n_loops, done, total))
+        n_ok, n_fail, n_skip = asyncio.run(_run(items, worker, output, key, clients, n_loops, done, total))
     finish_meta(meta_path, meta, items_ok=n_ok, items_failed=n_fail, items_skipped=n_skip,
                 **({} if complete else {"incomplete": True}))
     return not n_fail and complete
@@ -252,7 +256,7 @@ def _producer_finished(meta_path, since):
     return bool(runs) and (runs[-1].get("finished") or "") >= since
 
 
-async def _follow(load, producer_meta, timeout_min, worker, output, key, client, n_loops, done):
+async def _follow(load, producer_meta, timeout_min, worker, output, key, clients, n_loops, done):
     """Process items as another job appends them to the input: every FOLLOW_POLL_SECONDS, load()
     the input again and process the new items. Stop when the producer's run (producer_meta)
     finishes after we started and everything is processed, or when nothing new has appeared for
@@ -267,7 +271,7 @@ async def _follow(load, producer_meta, timeout_min, worker, output, key, client,
         finished = _producer_finished(producer_meta, since)  # check before loading: no line is missed
         new = [it for it in load() if it[key] not in attempted]
         if new:
-            ok, fail, skip = await _run(new, worker, output, key, client, n_loops, set(), len(new))
+            ok, fail, skip = await _run(new, worker, output, key, clients, n_loops, set(), len(new))
             attempted.update(it[key] for it in new)
             n_ok, n_fail, n_skip = n_ok + ok, n_fail + fail, n_skip + skip
             last_new = time.time()
@@ -305,9 +309,9 @@ def _done_keys(output, key):
     return done
 
 
-async def _run(items, worker, output, key, client, n_loops, done, total=None):
+async def _run(items, worker, output, key, clients, n_loops, done, total=None):
     """Process the items not in `done` with `n_loops` concurrent loops, each taking the next item from
-    the shared iterator, and append the results to `output`."""
+    the shared iterator, and append the results to `output`. The loops are spread evenly over `clients`."""
     print(f"{total if total is not None else '?'} items, {len(done)} already in {output}, "
           f"{n_loops} requests at a time", flush=True)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -316,7 +320,7 @@ async def _run(items, worker, output, key, client, n_loops, done, total=None):
     start = last_report = time.time()
 
     with open(output, "a", encoding="utf-8") as out:
-        async def loop():
+        async def loop(client):
             nonlocal n_ok, n_fail, n_done, n_skip, last_report
             for item in pending:  # shared: every item is taken by exactly one loop
                 if item[key] in done:
@@ -342,7 +346,7 @@ async def _run(items, worker, output, key, client, n_loops, done, total=None):
                     left = "" if total is None else f", {n_left} left, ETA {n_left / 60 / rate:.0f} min"
                     print(f"{n_ok} done, {n_fail} failed, {n_skip} skipped, {rate:.2f} items/s{left}", flush=True)
 
-        await asyncio.gather(*(loop() for _ in range(n_loops)))
+        await asyncio.gather(*(loop(clients[i % len(clients)]) for i in range(n_loops)))
 
     print(f"finished: {n_ok} ok, {n_fail} failed, {n_skip} skipped, {n_done} already done, "
           f"{time.time() - start:.0f}s", flush=True)
